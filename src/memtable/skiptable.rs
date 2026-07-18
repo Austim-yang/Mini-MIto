@@ -1,4 +1,4 @@
-use std::{cell::RefCell, cmp::Ordering, rc::Rc};
+use std::{cell::RefCell, cmp::Ordering, marker::PhantomData, rc::Rc};
 
 use rand::RngExt;
 
@@ -182,6 +182,31 @@ impl<K: std::fmt::Debug, V: std::fmt::Debug> SkipList<K, V> {
             }
             println!();
         }
+    }
+}
+
+impl<K: Clone, V: Clone> SkipList<K, V> {
+    pub fn iter(&self) -> Iter<K, V> {
+        Iter {
+            current: self.head.borrow().next[0].clone(),
+        }
+    }
+}
+pub struct Iter<K, V> {
+    current: Option<Rc<RefCell<Node<K, V>>>>,
+}
+
+impl<K: Clone, V: Clone> Iterator for Iter<K, V> {
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.current.take().map(|node| {
+            let node_ref = node.borrow();
+            let key = node_ref.key.clone();
+            let value = node_ref.value.clone();
+            self.current = node_ref.next[0].clone();
+            (key, value)
+        })
     }
 }
 
