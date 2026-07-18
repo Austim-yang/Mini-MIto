@@ -11,9 +11,10 @@ LSM-Tree（Log-Structured Merge-Tree）是现代高性能数据库（如 Greptim
 
 | 组件 | 说明 |
 | :--- | :--- |
-| **跳表（SkipList）** | 单线程内存索引，支持插入、查询、删除、长度统计，基于 `Rc<RefCell>` 管理节点。 |
+| **跳表（SkipList）** | 单线程内存索引，支持插入、查询、删除、长度统计，基于 `Rc<RefCell>` 管理节点，已添加迭代器。 |
 | **预写日志（WAL）** | 追加写入，JSON 序列化，支持崩溃恢复。 |
-| **Memtable** | 封装跳表和 WAL，启动时自动恢复数据，提供统一的读写接口。 |
+| **Memtable** | 封装跳表和 WAL，启动时自动恢复数据，提供统一的读写接口。 自动刷新阈值（默认 1000 条），超限时生成 SSTable 并重置 WAL；查询按新到旧顺序合并跳表和 SSTable。 |
+| **SSTable** | 基于 Parquet 格式存储键值对（Binary 列，序列化为 JSON 字节），支持 create_from_skiplist、点查 get 和范围扫描 scan，附带 min_key/max_key 元数据加速过滤。 |
 | **单元测试** | 覆盖内存表、WAL 和持久化恢复，全部通过。 |
 
 ## 技术栈
@@ -22,6 +23,7 @@ LSM-Tree（Log-Structured Merge-Tree）是现代高性能数据库（如 Greptim
 - `serde` + `serde_json`
 - `rand`
 - `tempfile`
+- `parquet` + `arrow` + `arrow-schema`
 
 ## 构建与运行
 
