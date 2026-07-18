@@ -30,7 +30,7 @@ where
     V: Clone + Default + serde::Serialize + for<'de> serde::Deserialize<'de>,
 {
     pub fn create_from_skiplist(
-        skiplist: SkipList<K, V>,
+        skiplist: &SkipList<K, V>,
         path: impl AsRef<Path>,
     ) -> io::Result<Self> {
         let mut keys_bytes = Vec::new();
@@ -207,7 +207,7 @@ mod tests {
         skiplist.insert(20, "twenty".to_string());
         skiplist.insert(30, "thirty".to_string());
 
-        let sstable = SSTable::create_from_skiplist(skiplist, &path)?;
+        let sstable = SSTable::create_from_skiplist(&skiplist, &path)?;
 
         assert_eq!(sstable.entry_count(), 3);
         assert_eq!(sstable.min_key(), &10);
@@ -239,7 +239,7 @@ mod tests {
         skiplist.insert(40, "forty".to_string());
         skiplist.insert(50, "fifty".to_string());
 
-        let sstable = SSTable::create_from_skiplist(skiplist, &path)?;
+        let sstable = SSTable::create_from_skiplist(&skiplist, &path)?;
 
         let result = sstable.scan(&20, &40)?;
         assert_eq!(result.len(), 3);

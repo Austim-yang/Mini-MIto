@@ -75,7 +75,7 @@ impl Wal {
         self.writer.flush()
     }
 
-    pub fn close(mut self) -> io::Result<()> {
+    pub fn close(&mut self) -> io::Result<()> {
         self.flush()?;
         self.writer.get_ref().sync_all()?;
         Ok(())
