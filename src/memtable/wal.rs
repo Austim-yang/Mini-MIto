@@ -110,8 +110,8 @@ mod tests {
         let wal_recover = Wal::new(&path).unwrap();
         wal_recover.recover(&mut list).unwrap();
 
-        assert_eq!(list.get(&1), Some("one".to_string()));
-        assert_eq!(list.get(&2), Some("two".to_string()));
+        assert_eq!(list.get(&1), Some(Some("one".to_string())));
+        assert_eq!(list.get(&2), Some(Some("two".to_string())));
         assert_eq!(list.len(), 2);
     }
 
@@ -139,7 +139,7 @@ mod tests {
         let wal_recover = Wal::new(&path).unwrap();
         wal_recover.recover(&mut list).unwrap();
 
-        assert_eq!(list.get(&10), None);
+        assert_eq!(list.get(&10), Some(None));
         assert_eq!(list.len(), 1);
     }
 

@@ -1,5 +1,5 @@
 use std::{
-    fs,
+    fs::{self},
     io::{self, BufRead, Write},
     path::{Path, PathBuf},
 };
@@ -66,16 +66,19 @@ where
         if self.skiplist.len() >= self.flush_threshold {
             self.flush()?;
         }
+        if self.immutable_ssts.len() >= 4 {
+            self.compact()?;
+        }
         Ok(old_value)
     }
 
     pub fn get(&self, key: &K) -> io::Result<Option<V>> {
         if let Some(value) = self.skiplist.get(key) {
-            return Ok(Some(value));
+            return Ok(value);
         }
-        for sst in &self.immutable_ssts {
+        for sst in self.immutable_ssts.iter().rev() {
             if let Some(value) = sst.get(key)? {
-                return Ok(Some(value));
+                return Ok(value);
             }
         }
         Ok(None)
@@ -87,6 +90,9 @@ where
         let old_value = self.skiplist.remove(key);
         if self.skiplist.len() >= self.flush_threshold {
             self.flush()?;
+        }
+        if self.immutable_ssts.len() >= 4 {
+            self.compact()?;
         }
         Ok(old_value)
     }
@@ -199,6 +205,39 @@ where
         Ok(())
     }
 
+    pub fn compact(&mut self) -> io::Result<()> {
+        if self.immutable_ssts.len() < 4 {
+            return Ok(());
+        }
+
+        let mut temp_skiplist = SkipList::new();
+
+        for sst in &self.immutable_ssts {
+            let pairs = sst.scan(sst.min_key(), sst.max_key())?;
+            for (k, v) in pairs {
+                temp_skiplist.insert(k, v);
+            }
+        }
+
+        let new_id = self.sst_id;
+        self.sst_id += 1;
+        let new_path = self
+            .wal_path
+            .parent()
+            .unwrap()
+            .join(format!("{:04}.sst", new_id));
+        let new_sst = SSTable::create_from_skiplist(&temp_skiplist, new_id, &new_path, false)?;
+        let new_list = vec![new_sst];
+        let old_ssts = std::mem::replace(&mut self.immutable_ssts, new_list);
+        self.write_manifest()?;
+
+        for sst in &old_ssts {
+            let _ = std::fs::remove_file(sst.path());
+        }
+
+        Ok(())
+    }
+
     pub fn flush(&mut self) -> io::Result<()> {
         if self.skiplist.len() == 0 {
             return Ok(());
@@ -209,7 +248,7 @@ where
             .parent()
             .unwrap_or(Path::new("."))
             .join(sst_filename);
-        let sst = SSTable::create_from_skiplist(&self.skiplist, self.sst_id, &sst_path)?;
+        let sst = SSTable::create_from_skiplist(&self.skiplist, self.sst_id, &sst_path, true)?;
         self.immutable_ssts.push(sst);
         self.sst_id += 1;
 
@@ -377,6 +416,42 @@ mod tests {
             assert_eq!(mem.get(&1)?, Some("a".to_string()));
             assert_eq!(mem.get(&4)?, Some("d".to_string()));
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_compaction() -> io::Result<()> {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal.log");
+        let mut mem = Memtable::new(&wal_path)?;
+        mem.flush_threshold = 2;
+
+        for i in 0..8 {
+            mem.insert(i, format!("v{}", i))?;
+        }
+
+        assert_eq!(mem.immutable_ssts.len(), 1);
+        assert_eq!(mem.immutable_ssts[0].entry_count(), 8);
+
+        for i in 0..8 {
+            assert_eq!(mem.get(&i)?, Some(format!("v{}", i)));
+        }
+
+        mem.remove(3)?;
+        mem.remove(5)?;
+        mem.insert(8, "v8".to_string())?;
+        mem.insert(9, "v9".to_string())?;
+
+        assert_eq!(mem.immutable_ssts.len(), 3);
+        mem.compact()?;
+        assert_eq!(mem.immutable_ssts.len(), 3);
+
+        assert_eq!(mem.get(&3)?, None);
+        assert_eq!(mem.get(&5)?, None);
+        assert_eq!(mem.get(&0)?, Some("v0".to_string()));
+        assert_eq!(mem.get(&8)?, Some("v8".to_string()));
+        assert_eq!(mem.get(&9)?, Some("v9".to_string()));
 
         Ok(())
     }

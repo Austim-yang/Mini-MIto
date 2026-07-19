@@ -95,7 +95,7 @@ impl<K: Default + Ord + Clone, V: Clone> SkipList<K, V> {
         self.insert(key, None)
     }
 
-    pub fn get(&self, key: &K) -> Option<V> {
+    pub fn get(&self, key: &K) -> Option<Option<V>> {
         let mut cur = self.head.clone();
 
         for level in (0..MAX_HEIGHT).rev() {
@@ -104,7 +104,7 @@ impl<K: Default + Ord + Clone, V: Clone> SkipList<K, V> {
                 match next_opt {
                     Some(next_ref) if next_ref.borrow().key < *key => cur = next_ref,
                     Some(next_ref) if next_ref.borrow().key == *key => {
-                        return next_ref.borrow().value.clone();
+                        return Some(next_ref.borrow().value.clone());
                     }
                     _ => break,
                 }
@@ -220,7 +220,7 @@ mod tests {
     fn test_get() {
         let mut list = SkipList::new();
         list.insert(5, Some("hello"));
-        assert_eq!(list.get(&5), Some("hello"));
+        assert_eq!(list.get(&5), Some(Some("hello")));
         assert_eq!(list.get(&6), None);
     }
 
@@ -231,11 +231,11 @@ mod tests {
         list.insert(3, Some("world"));
         assert_eq!(list.remove(5), Some("hello"));
         assert_eq!(list.len(), 2);
-        assert_eq!(list.get(&5), None);
+        assert_eq!(list.get(&5), Some(None));
         assert_eq!(list.remove(5), None);
-        assert_eq!(list.get(&5), None);
+        assert_eq!(list.get(&5), Some(None));
         assert_eq!(list.remove(3), Some("world"));
-        assert_eq!(list.get(&3), None);
+        assert_eq!(list.get(&3), Some(None));
         assert_eq!(list.len(), 2);
     }
 }

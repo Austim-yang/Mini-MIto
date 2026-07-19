@@ -1,5 +1,10 @@
 use std::{
-    fs::File, io, marker::PhantomData, path::{Path, PathBuf}, sync::Arc, vec,
+    fs::File,
+    io,
+    marker::PhantomData,
+    path::{Path, PathBuf},
+    sync::Arc,
+    vec,
 };
 
 use arrow::array::{ArrayRef, BinaryArray, RecordBatch};
@@ -40,6 +45,7 @@ where
         skiplist: &SkipList<K, V>,
         id: usize,
         path: impl AsRef<Path>,
+        include_tombstones: bool,
     ) -> io::Result<Self> {
         let mut keys_bytes = Vec::new();
         let mut values_bytes = Vec::new();
@@ -48,6 +54,9 @@ where
         let mut count = 0;
 
         for (key, value) in skiplist.iter() {
+            if !include_tombstones && value.is_none() {
+                continue;
+            }
             let key_json = serde_json::to_vec(&key)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             let value_json = serde_json::to_vec(&value)
@@ -108,17 +117,23 @@ where
 
     pub fn open_from_path(path: impl AsRef<Path>) -> io::Result<Self> {
         let file = File::open(&path)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let mut reader = builder.build()?;
         let mut min_key = None;
         let mut max_key = None;
         let mut count = 0;
         while let Some(batch) = reader.next() {
             let batch = batch.unwrap();
-            let key_col = batch.column(0).as_any().downcast_ref::<BinaryArray>().unwrap();
+            let key_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap();
             for i in 0..batch.num_rows() {
                 let key_bytes = key_col.value(i);
-                let k: K = serde_json::from_slice(key_bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let k: K = serde_json::from_slice(key_bytes)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 if min_key.is_none() || k < *min_key.as_ref().unwrap() {
                     min_key = Some(k.clone());
                 }
@@ -130,12 +145,24 @@ where
         }
         let min_key = min_key.unwrap_or_default();
         let max_key = max_key.unwrap_or_default();
-        let id = path.as_ref().file_stem().unwrap().to_string_lossy().parse::<usize>().unwrap();
+        let id = path
+            .as_ref()
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .parse::<usize>()
+            .unwrap();
 
-        Ok(SSTable::new(id, path.as_ref().to_path_buf(), min_key, max_key, count))
+        Ok(SSTable::new(
+            id,
+            path.as_ref().to_path_buf(),
+            min_key,
+            max_key,
+            count,
+        ))
     }
 
-    pub fn get(&self, key: &K) -> io::Result<Option<V>> {
+    pub fn get(&self, key: &K) -> io::Result<Option<Option<V>>> {
         if self.entry_count == 0 || key < &self.min_key || key > &self.max_key {
             return Ok(None);
         }
@@ -163,7 +190,7 @@ where
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 if &k == key {
                     let val_bytes = value_col.value(i);
-                    let v: V = serde_json::from_slice(val_bytes)
+                    let v: Option<V> = serde_json::from_slice(val_bytes)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                     return Ok(Some(v));
                 }
@@ -173,7 +200,7 @@ where
         Ok(None)
     }
 
-    pub fn scan(&self, start: &K, end: &K) -> io::Result<Vec<(K, V)>> {
+    pub fn scan(&self, start: &K, end: &K) -> io::Result<Vec<(K, Option<V>)>> {
         if self.entry_count == 0 || start > end || end < &self.min_key || start > &self.max_key {
             return Ok(Vec::new());
         }
@@ -202,7 +229,7 @@ where
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 if k >= *start && k <= *end {
                     let val_bytes = value_col.value(i);
-                    let v: V = serde_json::from_slice(val_bytes)
+                    let v: Option<V> = serde_json::from_slice(val_bytes)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                     results.push((k, v));
                 }
@@ -249,22 +276,22 @@ mod tests {
         skiplist.insert(20, Some("twenty".to_string()));
         skiplist.insert(30, Some("thirty".to_string()));
 
-        let sstable = SSTable::create_from_skiplist(&skiplist, 1, &path)?;
+        let sstable = SSTable::create_from_skiplist(&skiplist, 1, &path, true)?;
 
         assert_eq!(sstable.entry_count(), 3);
         assert_eq!(sstable.min_key(), &10);
         assert_eq!(sstable.max_key(), &30);
 
-        assert_eq!(sstable.get(&10)?.as_deref(), Some("ten"));
-        assert_eq!(sstable.get(&20)?.as_deref(), Some("twenty"));
-        assert_eq!(sstable.get(&30)?.as_deref(), Some("thirty"));
+        assert_eq!(sstable.get(&10)?.unwrap().as_deref(), Some("ten"));
+        assert_eq!(sstable.get(&20)?.unwrap().as_deref(), Some("twenty"));
+        assert_eq!(sstable.get(&30)?.unwrap().as_deref(), Some("thirty"));
 
         assert_eq!(sstable.get(&5)?, None);
         assert_eq!(sstable.get(&25)?, None);
         assert_eq!(sstable.get(&40)?, None);
 
-        assert_eq!(sstable.get(&10)?.as_deref(), Some("ten"));
-        assert_eq!(sstable.get(&30)?.as_deref(), Some("thirty"));
+        assert_eq!(sstable.get(&10)?.unwrap().as_deref(), Some("ten"));
+        assert_eq!(sstable.get(&30)?.unwrap().as_deref(), Some("thirty"));
 
         Ok(())
     }
@@ -281,7 +308,7 @@ mod tests {
         skiplist.insert(40, Some("forty".to_string()));
         skiplist.insert(50, Some("fifty".to_string()));
 
-        let sstable = SSTable::create_from_skiplist(&skiplist, 1, &path)?;
+        let sstable = SSTable::create_from_skiplist(&skiplist, 1, &path, true)?;
 
         let result = sstable.scan(&20, &40)?;
         assert_eq!(result.len(), 3);
