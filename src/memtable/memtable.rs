@@ -1,6 +1,24 @@
-use std::{fs, io, path::{Path, PathBuf}};
+use std::{
+    fs,
+    io::{self, BufRead, Write},
+    path::{Path, PathBuf},
+};
 
-use crate::{memtable::{SkipList, Wal, wal::Operation}, sstable::sstable::SSTable};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    memtable::{SkipList, Wal, wal::Operation},
+    sstable::sstable::SSTable,
+};
+
+#[derive(Serialize, Deserialize)]
+pub struct ManifestEntry<K> {
+    id: usize,
+    path: String,
+    min_key: K,
+    max_key: K,
+    entry_count: usize,
+}
 
 pub struct Memtable<K, V> {
     skiplist: SkipList<K, V>,
@@ -9,6 +27,7 @@ pub struct Memtable<K, V> {
     flush_threshold: usize,
     sst_id: usize,
     immutable_ssts: Vec<SSTable<K, V>>,
+    manifest_path: PathBuf,
 }
 
 impl<K, V> Memtable<K, V>
@@ -17,17 +36,33 @@ where
     V: Clone + Default + for<'de> serde::Deserialize<'de> + serde::Serialize,
 {
     pub fn new<P: AsRef<Path>>(wal_path: P) -> io::Result<Self> {
-        let mut skiplist = SkipList::new();
-        let wal = Wal::new(&wal_path)?;
-        wal.recover(&mut skiplist)?;
+        let manifest_path = wal_path
+            .as_ref()
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("manifest");
+        let mut mem = Memtable {
+            skiplist: SkipList::new(),
+            wal: Wal::new(&wal_path)?,
+            wal_path: wal_path.as_ref().to_path_buf(),
+            flush_threshold: 1000,
+            sst_id: 0,
+            immutable_ssts: Vec::new(),
+            manifest_path,
+        };
+        mem.load_manafest()?;
+        mem.wal.recover(&mut mem.skiplist)?;
 
-        Ok(Memtable { skiplist, wal, wal_path: wal_path.as_ref().to_path_buf(), flush_threshold: 1000, sst_id: 0, immutable_ssts: Vec::new() })
+        Ok(mem)
     }
 
     pub fn insert(&mut self, key: K, value: V) -> io::Result<Option<V>> {
-        let op = Operation::Insert { key: key.clone(), value: value.clone(), };
+        let op = Operation::Insert {
+            key: key.clone(),
+            value: value.clone(),
+        };
         self.wal.append(&op)?;
-        let old_value = self.skiplist.insert(key, value);
+        let old_value = self.skiplist.insert(key, Some(value));
         if self.skiplist.len() >= self.flush_threshold {
             self.flush()?;
         }
@@ -36,7 +71,7 @@ where
 
     pub fn get(&self, key: &K) -> io::Result<Option<V>> {
         if let Some(value) = self.skiplist.get(key) {
-            return Ok(Some(value))
+            return Ok(Some(value));
         }
         for sst in &self.immutable_ssts {
             if let Some(value) = sst.get(key)? {
@@ -68,15 +103,121 @@ where
         self.wal.flush()
     }
 
+    fn write_manifest(&self) -> io::Result<()> {
+        let tmp_path = self.manifest_path.with_extension("tmp");
+        let file = fs::File::create(&tmp_path)?;
+        let mut writer = io::BufWriter::new(file);
+
+        for sst in &self.immutable_ssts {
+            let entry = ManifestEntry {
+                id: sst.id(),
+                path: sst
+                    .path()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                min_key: sst.min_key().clone(),
+                max_key: sst.max_key().clone(),
+                entry_count: sst.entry_count(),
+            };
+            let line = serde_json::to_string(&entry)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            writer.write_all(line.as_bytes())?;
+            writer.write_all(b"\n")?;
+        }
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        fs::rename(&tmp_path, &self.manifest_path)?;
+
+        Ok(())
+    }
+
+    fn load_manafest(&mut self) -> io::Result<()> {
+        if !self.manifest_path.exists() {
+            self.scan_exist_ssts()?;
+            self.write_manifest()?;
+            return Ok(());
+        }
+
+        let file = fs::File::open(&self.manifest_path)?;
+        let reader = io::BufReader::new(file);
+        let mut entries = Vec::new();
+
+        for line in reader.lines() {
+            let line = line?;
+            if line.is_empty() {
+                continue;
+            }
+            let entry: ManifestEntry<K> = serde_json::from_str(&line)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            entries.push(entry);
+        }
+
+        entries.sort_by_key(|e| e.id);
+
+        for entry in entries {
+            let sst_path = self.wal_path.parent().unwrap().join(&entry.path);
+            let sst = SSTable::new(
+                entry.id,
+                sst_path,
+                entry.min_key,
+                entry.max_key,
+                entry.entry_count,
+            );
+
+            self.immutable_ssts.push(sst);
+            if entry.id >= self.sst_id {
+                self.sst_id = entry.id + 1;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn scan_exist_ssts(&mut self) -> io::Result<()> {
+        let dir = self.wal_path.parent().unwrap_or(Path::new("."));
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("sst") {
+                let file_name = path.file_stem().unwrap().to_string_lossy();
+                if let Ok(id) = file_name.parse::<usize>() {
+                    let sst = SSTable::open_from_path(&path)?;
+                    entries.push((id, sst));
+                }
+            }
+        }
+        entries.sort_by_key(|(id, _)| *id);
+        for (id, sst) in entries {
+            self.immutable_ssts.push(sst);
+            if id >= self.sst_id {
+                self.sst_id = id + 1;
+            }
+        }
+        Ok(())
+    }
+
     pub fn flush(&mut self) -> io::Result<()> {
         if self.skiplist.len() == 0 {
-            return  Ok(());
+            return Ok(());
         }
         let sst_filename = format!("{:04}.sst", self.sst_id);
-        let sst_path = self.wal_path.parent().unwrap_or(Path::new(".")).join(sst_filename);
-        let sst = SSTable::create_from_skiplist(&self.skiplist, &sst_path)?;
+        let sst_path = self
+            .wal_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(sst_filename);
+        let sst = SSTable::create_from_skiplist(&self.skiplist, self.sst_id, &sst_path)?;
         self.immutable_ssts.push(sst);
         self.sst_id += 1;
+
+        if let Err(e) = self.write_manifest() {
+            let _ = fs::remove_file(&sst_path);
+            return Err(e);
+        }
+
         self.skiplist = SkipList::new();
         self.wal.close()?;
         if self.wal_path.exists() {
@@ -112,11 +253,15 @@ mod tests {
         assert_eq!(mem.get(&1).unwrap(), Some("one".to_string()));
         assert_eq!(mem.get(&3).unwrap(), None);
 
-        assert_eq!(mem.insert(1, "uno".to_string()).unwrap(), Some("one".to_string()));
+        assert_eq!(
+            mem.insert(1, "uno".to_string()).unwrap(),
+            Some("one".to_string())
+        );
         assert_eq!(mem.get(&1).unwrap(), Some("uno".to_string()));
 
         assert_eq!(mem.remove(2).unwrap(), Some("two".to_string()));
-        assert_eq!(mem.len(), 1);
+        assert_eq!(mem.len(), 2);
+        assert_eq!(mem.get(&2).unwrap(), None);
         assert_eq!(mem.remove(3).unwrap(), None);
 
         mem.close().unwrap();
@@ -173,22 +318,66 @@ mod tests {
     }
 
     #[test]
-fn test_memtable_flush_multiple() -> io::Result<()> {
-    let dir = tempdir().unwrap();
-    let wal_path = dir.path().join("wal.log");
-    let mut mem = Memtable::new(&wal_path)?;
-    mem.flush_threshold = 2;
+    fn test_memtable_flush_multiple() -> io::Result<()> {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal.log");
+        let mut mem = Memtable::new(&wal_path)?;
+        mem.flush_threshold = 2;
 
-    mem.insert(1, "a".to_string())?;
-    mem.insert(2, "b".to_string())?;  
-    assert_eq!(mem.immutable_ssts.len(), 1);
+        mem.insert(1, "a".to_string())?;
+        mem.insert(2, "b".to_string())?;
+        assert_eq!(mem.immutable_ssts.len(), 1);
 
-    mem.insert(3, "c".to_string())?;
-    mem.insert(4, "d".to_string())?;  
-    assert_eq!(mem.immutable_ssts.len(), 2);
+        mem.insert(3, "c".to_string())?;
+        mem.insert(4, "d".to_string())?;
+        assert_eq!(mem.immutable_ssts.len(), 2);
 
-    assert_eq!(mem.get(&1).unwrap(), Some("a".to_string()));
-    assert_eq!(mem.get(&4).unwrap(), Some("d".to_string()));
-    Ok(())
-}
+        assert_eq!(mem.get(&1).unwrap(), Some("a".to_string()));
+        assert_eq!(mem.get(&4).unwrap(), Some("d".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_memtable_manifest_fallback_scan() -> io::Result<()> {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal.log");
+        let manifest_path = dir.path().join("manifest");
+
+        {
+            let mut mem = Memtable::new(&wal_path)?;
+            mem.flush_threshold = 2;
+
+            mem.insert(1, "a".to_string())?;
+            mem.insert(2, "b".to_string())?;
+            mem.insert(3, "c".to_string())?;
+            mem.insert(4, "d".to_string())?;
+
+            assert_eq!(mem.immutable_ssts.len(), 2);
+            assert!(manifest_path.exists());
+            mem.close()?;
+        }
+
+        fs::remove_file(&manifest_path)?;
+        assert!(!manifest_path.exists());
+
+        {
+            let mem = Memtable::new(&wal_path)?;
+            assert_eq!(mem.immutable_ssts.len(), 2);
+            assert_eq!(mem.sst_id, 2);
+            assert_eq!(mem.get(&1)?, Some("a".to_string()));
+            assert_eq!(mem.get(&2)?, Some("b".to_string()));
+            assert_eq!(mem.get(&3)?, Some("c".to_string()));
+            assert_eq!(mem.get(&4)?, Some("d".to_string()));
+            assert!(manifest_path.exists());
+        }
+
+        {
+            let mem = Memtable::new(&wal_path)?;
+            assert_eq!(mem.immutable_ssts.len(), 2);
+            assert_eq!(mem.get(&1)?, Some("a".to_string()));
+            assert_eq!(mem.get(&4)?, Some("d".to_string()));
+        }
+
+        Ok(())
+    }
 }

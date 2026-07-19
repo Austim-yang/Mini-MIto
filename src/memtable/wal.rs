@@ -61,7 +61,7 @@ impl Wal {
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             match op {
                 Operation::Insert { key, value } | Operation::Update { key, value } => {
-                    skiplist.insert(key, value);
+                    skiplist.insert(key, Some(value));
                 }
                 Operation::Delete { key } => {
                     skiplist.remove(key);
@@ -94,8 +94,16 @@ mod tests {
         let path = dir.path().join("test.log");
         let mut wal = Wal::new(&path).unwrap();
 
-        wal.append(&Operation::Insert { key: 1, value: "one".to_string() }).unwrap();
-        wal.append(&Operation::Insert { key: 2, value: "two".to_string() }).unwrap();
+        wal.append(&Operation::Insert {
+            key: 1,
+            value: "one".to_string(),
+        })
+        .unwrap();
+        wal.append(&Operation::Insert {
+            key: 2,
+            value: "two".to_string(),
+        })
+        .unwrap();
         wal.close().unwrap();
 
         let mut list: SkipList<i32, String> = SkipList::new();
@@ -113,9 +121,18 @@ mod tests {
         let path = dir.path().join("test.log");
         let mut wal = Wal::new(&path).unwrap();
 
-        wal.append(&Operation::Insert { key: 10, value: "old".to_string() }).unwrap();
-        wal.append(&Operation::Update { key: 10, value: "new".to_string() }).unwrap();
-        wal.append(&Operation::<i32, String>::Delete { key: 10 }).unwrap();
+        wal.append(&Operation::Insert {
+            key: 10,
+            value: "old".to_string(),
+        })
+        .unwrap();
+        wal.append(&Operation::Update {
+            key: 10,
+            value: "new".to_string(),
+        })
+        .unwrap();
+        wal.append(&Operation::<i32, String>::Delete { key: 10 })
+            .unwrap();
         wal.close().unwrap();
 
         let mut list: SkipList<i32, String> = SkipList::new();
@@ -123,7 +140,7 @@ mod tests {
         wal_recover.recover(&mut list).unwrap();
 
         assert_eq!(list.get(&10), None);
-        assert_eq!(list.len(), 0);
+        assert_eq!(list.len(), 1);
     }
 
     #[test]

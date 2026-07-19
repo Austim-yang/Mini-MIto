@@ -1,10 +1,5 @@
 use std::{
-    fs::File,
-    io,
-    marker::PhantomData,
-    path::{Path, PathBuf},
-    sync::Arc,
-    vec,
+    fs::File, io, marker::PhantomData, path::{Path, PathBuf}, sync::Arc, vec,
 };
 
 use arrow::array::{ArrayRef, BinaryArray, RecordBatch};
@@ -17,6 +12,7 @@ use parquet::{
 use crate::memtable::SkipList;
 
 pub struct SSTable<K, V> {
+    id: usize,
     path: PathBuf,
     min_key: K,
     max_key: K,
@@ -29,8 +25,20 @@ where
     K: Ord + Clone + Default + serde::Serialize + for<'de> serde::Deserialize<'de>,
     V: Clone + Default + serde::Serialize + for<'de> serde::Deserialize<'de>,
 {
+    pub fn new(id: usize, path: PathBuf, min_key: K, max_key: K, entry_count: usize) -> Self {
+        SSTable {
+            id,
+            path,
+            min_key,
+            max_key,
+            entry_count,
+            _marker: PhantomData,
+        }
+    }
+
     pub fn create_from_skiplist(
         skiplist: &SkipList<K, V>,
+        id: usize,
         path: impl AsRef<Path>,
     ) -> io::Result<Self> {
         let mut keys_bytes = Vec::new();
@@ -89,12 +97,42 @@ where
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         Ok(SSTable {
+            id,
             path: path.as_ref().to_path_buf(),
             min_key,
             max_key,
             entry_count: count,
             _marker: PhantomData,
         })
+    }
+
+    pub fn open_from_path(path: impl AsRef<Path>) -> io::Result<Self> {
+        let file = File::open(&path)?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut reader = builder.build()?;
+        let mut min_key = None;
+        let mut max_key = None;
+        let mut count = 0;
+        while let Some(batch) = reader.next() {
+            let batch = batch.unwrap();
+            let key_col = batch.column(0).as_any().downcast_ref::<BinaryArray>().unwrap();
+            for i in 0..batch.num_rows() {
+                let key_bytes = key_col.value(i);
+                let k: K = serde_json::from_slice(key_bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                if min_key.is_none() || k < *min_key.as_ref().unwrap() {
+                    min_key = Some(k.clone());
+                }
+                if max_key.is_none() || k > *max_key.as_ref().unwrap() {
+                    max_key = Some(k.clone());
+                }
+                count += 1;
+            }
+        }
+        let min_key = min_key.unwrap_or_default();
+        let max_key = max_key.unwrap_or_default();
+        let id = path.as_ref().file_stem().unwrap().to_string_lossy().parse::<usize>().unwrap();
+
+        Ok(SSTable::new(id, path.as_ref().to_path_buf(), min_key, max_key, count))
     }
 
     pub fn get(&self, key: &K) -> io::Result<Option<V>> {
@@ -174,6 +212,10 @@ where
         Ok(results)
     }
 
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
     pub fn path(&self) -> &PathBuf {
         &self.path
     }
@@ -203,11 +245,11 @@ mod tests {
         let path = dir.path().join("test.sst");
 
         let mut skiplist = SkipList::new();
-        skiplist.insert(10, "ten".to_string());
-        skiplist.insert(20, "twenty".to_string());
-        skiplist.insert(30, "thirty".to_string());
+        skiplist.insert(10, Some("ten".to_string()));
+        skiplist.insert(20, Some("twenty".to_string()));
+        skiplist.insert(30, Some("thirty".to_string()));
 
-        let sstable = SSTable::create_from_skiplist(&skiplist, &path)?;
+        let sstable = SSTable::create_from_skiplist(&skiplist, 1, &path)?;
 
         assert_eq!(sstable.entry_count(), 3);
         assert_eq!(sstable.min_key(), &10);
@@ -233,13 +275,13 @@ mod tests {
         let path = dir.path().join("test_scan.sst");
 
         let mut skiplist = SkipList::new();
-        skiplist.insert(10, "ten".to_string());
-        skiplist.insert(20, "twenty".to_string());
-        skiplist.insert(30, "thirty".to_string());
-        skiplist.insert(40, "forty".to_string());
-        skiplist.insert(50, "fifty".to_string());
+        skiplist.insert(10, Some("ten".to_string()));
+        skiplist.insert(20, Some("twenty".to_string()));
+        skiplist.insert(30, Some("thirty".to_string()));
+        skiplist.insert(40, Some("forty".to_string()));
+        skiplist.insert(50, Some("fifty".to_string()));
 
-        let sstable = SSTable::create_from_skiplist(&skiplist, &path)?;
+        let sstable = SSTable::create_from_skiplist(&skiplist, 1, &path)?;
 
         let result = sstable.scan(&20, &40)?;
         assert_eq!(result.len(), 3);
