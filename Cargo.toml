@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 arrow = "59.1.0"
 arrow-schema = "59.1.0"
+datafusion = "54.0.0"
+futures = "0.3.33"
 parquet = "59.1.0"
 rand = "0.10.2"
 serde = {version = "=1.0.228", features = ["derive"]}
