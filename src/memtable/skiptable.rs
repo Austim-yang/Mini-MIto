@@ -2,19 +2,21 @@ use std::{cell::RefCell, cmp::Ordering, rc::Rc};
 
 use rand::RngExt;
 
+use crate::types::{Key, Value};
+
 const MAX_HEIGHT: usize = 32;
 const SKIP_P: f32 = 0.5;
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct Node<K, V> {
-    pub key: K,
-    pub value: Option<V>,
+pub struct Node {
+    pub key: Key,
+    pub value: Option<Value>,
     pub height: usize,
-    pub next: [Option<Rc<RefCell<Node<K, V>>>>; MAX_HEIGHT],
+    pub next: [Option<Rc<RefCell<Node>>>; MAX_HEIGHT],
 }
 
-impl<K, V> Node<K, V> {
-    pub fn new(key: K, value: Option<V>, height: usize) -> Self {
+impl Node {
+    pub fn new(key: Key, value: Option<Value>, height: usize) -> Self {
         assert!(height > 0 && height <= MAX_HEIGHT);
         Node {
             key,
@@ -25,21 +27,21 @@ impl<K, V> Node<K, V> {
     }
 }
 
-pub struct SkipList<K, V> {
-    head: Rc<RefCell<Node<K, V>>>,
+pub struct SkipList {
+    head: Rc<RefCell<Node>>,
     len: usize,
 }
 
-impl<K: Default + Ord + Clone, V: Clone> SkipList<K, V> {
+impl SkipList {
     pub fn new() -> Self {
-        let head_node = Node::new(K::default(), None, MAX_HEIGHT);
+        let head_node = Node::new(Key::default(), None, MAX_HEIGHT);
         SkipList {
             head: Rc::new(RefCell::new(head_node)),
             len: 0,
         }
     }
 
-    pub fn insert(&mut self, key: K, value: Option<V>) -> Option<V> {
+    pub fn insert(&mut self, key: Key, value: Option<Value>) -> Option<Value> {
         let mut pre = vec![None; MAX_HEIGHT];
         let mut cur = self.head.clone();
         let mut found = None;
@@ -91,11 +93,11 @@ impl<K: Default + Ord + Clone, V: Clone> SkipList<K, V> {
         None
     }
 
-    pub fn remove(&mut self, key: K) -> Option<V> {
+    pub fn remove(&mut self, key: Key) -> Option<Value> {
         self.insert(key, None)
     }
 
-    pub fn get(&self, key: &K) -> Option<Option<V>> {
+    pub fn get(&self, key: &Key) -> Option<Option<Value>> {
         let mut cur = self.head.clone();
 
         for level in (0..MAX_HEIGHT).rev() {
@@ -119,7 +121,7 @@ impl<K: Default + Ord + Clone, V: Clone> SkipList<K, V> {
     }
 }
 
-impl<K: std::fmt::Debug, V: std::fmt::Debug> SkipList<K, V> {
+impl SkipList {
     #[cfg(test)]
     fn print_all_levels(&self) {
         for level in (0..MAX_HEIGHT).rev() {
@@ -144,19 +146,19 @@ impl<K: std::fmt::Debug, V: std::fmt::Debug> SkipList<K, V> {
     }
 }
 
-impl<K: Clone, V: Clone> SkipList<K, V> {
-    pub fn iter(&self) -> Iter<K, V> {
+impl SkipList {
+    pub fn iter(&self) -> Iter {
         Iter {
             current: self.head.borrow().next[0].clone(),
         }
     }
 }
-pub struct Iter<K, V> {
-    current: Option<Rc<RefCell<Node<K, V>>>>,
+pub struct Iter {
+    current: Option<Rc<RefCell<Node>>>,
 }
 
-impl<K: Clone, V: Clone> Iterator for Iter<K, V> {
-    type Item = (K, Option<V>);
+impl Iterator for Iter {
+    type Item = (Key, Option<Value>);
 
     fn next(&mut self) -> Option<Self::Item> {
         self.current.take().map(|node| {
@@ -182,19 +184,26 @@ fn random_level() -> usize {
 mod tests {
     use super::*;
 
+    fn k(tag: u8, ts: i64) -> Key {
+        (vec![tag], ts)
+    }
+    fn v(s: &str) -> Value {
+        s.as_bytes().to_vec()
+    }
+
     #[test]
     fn insert_single() {
         let mut list = SkipList::new();
-        list.insert(10, Some("hello"));
+        list.insert(k(10, 0), Some(v("hello")));
         list.print_all_levels();
     }
 
     #[test]
     fn insert_multiple_ordered() {
         let mut list = SkipList::new();
-        list.insert(1, Some("a"));
-        list.insert(2, Some("b"));
-        list.insert(3, Some("c"));
+        list.insert(k(1, 0), Some(v("a")));
+        list.insert(k(2, 0), Some(v("b")));
+        list.insert(k(3, 0), Some(v("c")));
         list.print_all_levels();
         assert_eq!(3, list.len());
     }
@@ -202,40 +211,40 @@ mod tests {
     #[test]
     fn insert_multiple_reverse() {
         let mut list = SkipList::new();
-        list.insert(3, Some("c"));
-        list.insert(2, Some("b"));
-        list.insert(1, Some("a"));
+        list.insert(k(3, 0), Some(v("c")));
+        list.insert(k(2, 0), Some(v("b")));
+        list.insert(k(1, 0), Some(v("a")));
     }
 
     #[test]
     fn insert_update() {
         let mut list = SkipList::new();
-        let old = list.insert(5, Some("old"));
+        let old = list.insert(k(5, 0), Some(v("old")));
         assert_eq!(old, None);
-        let old = list.insert(5, Some("new"));
-        assert_eq!(old, Some("old"));
+        let old = list.insert(k(5, 0), Some(v("new")));
+        assert_eq!(old, Some(v("old")));
     }
 
     #[test]
     fn test_get() {
         let mut list = SkipList::new();
-        list.insert(5, Some("hello"));
-        assert_eq!(list.get(&5), Some(Some("hello")));
-        assert_eq!(list.get(&6), None);
+        list.insert(k(5, 0), Some(v("hello")));
+        assert_eq!(list.get(&k(5, 0)), Some(Some(v("hello"))));
+        assert_eq!(list.get(&k(6, 0)), None);
     }
 
     #[test]
     fn test_remove() {
         let mut list = SkipList::new();
-        list.insert(5, Some("hello"));
-        list.insert(3, Some("world"));
-        assert_eq!(list.remove(5), Some("hello"));
+        list.insert(k(5, 0), Some(v("hello")));
+        list.insert(k(3, 0), Some(v("world")));
+        assert_eq!(list.remove(k(5, 0)), Some(v("hello")));
         assert_eq!(list.len(), 2);
-        assert_eq!(list.get(&5), Some(None));
-        assert_eq!(list.remove(5), None);
-        assert_eq!(list.get(&5), Some(None));
-        assert_eq!(list.remove(3), Some("world"));
-        assert_eq!(list.get(&3), Some(None));
+        assert_eq!(list.get(&k(5, 0)), Some(None));
+        assert_eq!(list.remove(k(5, 0)), None);
+        assert_eq!(list.get(&k(5, 0)), Some(None));
+        assert_eq!(list.remove(k(3, 0)), Some(v("world")));
+        assert_eq!(list.get(&k(3, 0)), Some(None));
         assert_eq!(list.len(), 2);
     }
 }

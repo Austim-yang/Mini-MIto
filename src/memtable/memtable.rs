@@ -9,32 +9,29 @@ use serde::{Deserialize, Serialize};
 use crate::{
     memtable::{SkipList, Wal, wal::Operation},
     sstable::sstable::SSTable,
+    types::{Key, Value},
 };
 
 #[derive(Serialize, Deserialize)]
-pub struct ManifestEntry<K> {
+pub struct ManifestEntry {
     id: usize,
     path: String,
-    min_key: K,
-    max_key: K,
+    min_key: Key,
+    max_key: Key,
     entry_count: usize,
 }
 
-pub struct Memtable<K, V> {
-    skiplist: SkipList<K, V>,
+pub struct Memtable {
+    skiplist: SkipList,
     wal: Wal,
     wal_path: PathBuf,
     flush_threshold: usize,
     sst_id: usize,
-    immutable_ssts: Vec<SSTable<K, V>>,
+    immutable_ssts: Vec<SSTable>,
     manifest_path: PathBuf,
 }
 
-impl<K, V> Memtable<K, V>
-where
-    K: Ord + Clone + Default + for<'de> serde::Deserialize<'de> + serde::Serialize,
-    V: Clone + Default + for<'de> serde::Deserialize<'de> + serde::Serialize,
-{
+impl Memtable {
     pub fn new<P: AsRef<Path>>(wal_path: P) -> io::Result<Self> {
         let manifest_path = wal_path
             .as_ref()
@@ -56,7 +53,7 @@ where
         Ok(mem)
     }
 
-    pub fn insert(&mut self, key: K, value: V) -> io::Result<Option<V>> {
+    pub fn insert(&mut self, key: Key, value: Value) -> io::Result<Option<Value>> {
         let op = Operation::Insert {
             key: key.clone(),
             value: value.clone(),
@@ -72,7 +69,7 @@ where
         Ok(old_value)
     }
 
-    pub fn get(&self, key: &K) -> io::Result<Option<V>> {
+    pub fn get(&self, key: &Key) -> io::Result<Option<Value>> {
         if let Some(value) = self.skiplist.get(key) {
             return Ok(value);
         }
@@ -84,8 +81,8 @@ where
         Ok(None)
     }
 
-    pub fn remove(&mut self, key: K) -> io::Result<Option<V>> {
-        let op = Operation::<K, V>::Delete { key: key.clone() };
+    pub fn remove(&mut self, key: Key) -> io::Result<Option<Value>> {
+        let op = Operation::Delete { key: key.clone() };
         self.wal.append(&op)?;
         let old_value = self.skiplist.remove(key);
         if self.skiplist.len() >= self.flush_threshold {
@@ -155,7 +152,7 @@ where
             if line.is_empty() {
                 continue;
             }
-            let entry: ManifestEntry<K> = serde_json::from_str(&line)
+            let entry: ManifestEntry = serde_json::from_str(&line)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             entries.push(entry);
         }
@@ -277,31 +274,35 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn k(tag: u8, ts: i64) -> Key {
+        (vec![tag], ts)
+    }
+    fn v(s: &str) -> Value {
+        s.as_bytes().to_vec()
+    }
+
     #[test]
     fn test_memtable_insert_get_remove() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.log");
-        let mut mem = Memtable::<i32, String>::new(&path).unwrap();
+        let mut mem = Memtable::new(&path).unwrap();
         assert!(mem.is_empty());
         assert_eq!(mem.len(), 0);
 
-        assert_eq!(mem.insert(1, "one".to_string()).unwrap(), None);
-        assert_eq!(mem.insert(2, "two".to_string()).unwrap(), None);
+        assert_eq!(mem.insert(k(1, 0), v("one")).unwrap(), None);
+        assert_eq!(mem.insert(k(2, 0), v("two")).unwrap(), None);
         assert_eq!(mem.len(), 2);
 
-        assert_eq!(mem.get(&1).unwrap(), Some("one".to_string()));
-        assert_eq!(mem.get(&3).unwrap(), None);
+        assert_eq!(mem.get(&k(1, 0)).unwrap(), Some(v("one")));
+        assert_eq!(mem.get(&k(3, 0)).unwrap(), None);
 
-        assert_eq!(
-            mem.insert(1, "uno".to_string()).unwrap(),
-            Some("one".to_string())
-        );
-        assert_eq!(mem.get(&1).unwrap(), Some("uno".to_string()));
+        assert_eq!(mem.insert(k(1, 0), v("uno")).unwrap(), Some(v("one")));
+        assert_eq!(mem.get(&k(1, 0)).unwrap(), Some(v("uno")));
 
-        assert_eq!(mem.remove(2).unwrap(), Some("two".to_string()));
+        assert_eq!(mem.remove(k(2, 0)).unwrap(), Some(v("two")));
         assert_eq!(mem.len(), 2);
-        assert_eq!(mem.get(&2).unwrap(), None);
-        assert_eq!(mem.remove(3).unwrap(), None);
+        assert_eq!(mem.get(&k(2, 0)).unwrap(), None);
+        assert_eq!(mem.remove(k(3, 0)).unwrap(), None);
 
         mem.close().unwrap();
     }
@@ -312,17 +313,17 @@ mod tests {
         let path = dir.path().join("test.log");
 
         {
-            let mut mem = Memtable::<i32, String>::new(&path).unwrap();
-            mem.insert(1, "one".to_string()).unwrap();
-            mem.insert(2, "two".to_string()).unwrap();
+            let mut mem = Memtable::new(&path).unwrap();
+            mem.insert(k(1, 0), v("one")).unwrap();
+            mem.insert(k(2, 0), v("two")).unwrap();
             mem.close().unwrap();
         }
 
         {
-            let mem = Memtable::<i32, String>::new(&path).unwrap();
+            let mem = Memtable::new(&path).unwrap();
             assert_eq!(mem.len(), 2);
-            assert_eq!(mem.get(&1).unwrap(), Some("one".to_string()));
-            assert_eq!(mem.get(&2).unwrap(), Some("two".to_string()));
+            assert_eq!(mem.get(&k(1, 0)).unwrap(), Some(v("one")));
+            assert_eq!(mem.get(&k(2, 0)).unwrap(), Some(v("two")));
         }
     }
 
@@ -332,13 +333,13 @@ mod tests {
         let path = dir.path().join("empty.log");
 
         {
-            let mut mem = Memtable::<i32, String>::new(&path).unwrap();
+            let mut mem = Memtable::new(&path).unwrap();
             assert!(mem.is_empty());
             mem.close().unwrap();
         }
 
         {
-            let mem = Memtable::<i32, String>::new(&path).unwrap();
+            let mem = Memtable::new(&path).unwrap();
             assert!(mem.is_empty());
         }
     }
@@ -347,13 +348,13 @@ mod tests {
     fn test_memtable_flush() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.log");
-        let mut mem = Memtable::<i32, String>::new(&path).unwrap();
-        mem.insert(1, "one".to_string()).unwrap();
+        let mut mem = Memtable::new(&path).unwrap();
+        mem.insert(k(1, 0), v("one")).unwrap();
         mem.flush_wal().unwrap();
         mem.close().unwrap();
 
-        let mem2 = Memtable::<i32, String>::new(&path).unwrap();
-        assert_eq!(mem2.get(&1).unwrap(), Some("one".to_string()));
+        let mem2 = Memtable::new(&path).unwrap();
+        assert_eq!(mem2.get(&k(1, 0)).unwrap(), Some(v("one")));
     }
 
     #[test]
@@ -363,16 +364,16 @@ mod tests {
         let mut mem = Memtable::new(&wal_path)?;
         mem.flush_threshold = 2;
 
-        mem.insert(1, "a".to_string())?;
-        mem.insert(2, "b".to_string())?;
+        mem.insert(k(1, 0), v("a"))?;
+        mem.insert(k(2, 0), v("b"))?;
         assert_eq!(mem.immutable_ssts.len(), 1);
 
-        mem.insert(3, "c".to_string())?;
-        mem.insert(4, "d".to_string())?;
+        mem.insert(k(3, 0), v("c"))?;
+        mem.insert(k(4, 0), v("d"))?;
         assert_eq!(mem.immutable_ssts.len(), 2);
 
-        assert_eq!(mem.get(&1).unwrap(), Some("a".to_string()));
-        assert_eq!(mem.get(&4).unwrap(), Some("d".to_string()));
+        assert_eq!(mem.get(&k(1, 0)).unwrap(), Some(v("a")));
+        assert_eq!(mem.get(&k(4, 0)).unwrap(), Some(v("d")));
         Ok(())
     }
 
@@ -386,10 +387,10 @@ mod tests {
             let mut mem = Memtable::new(&wal_path)?;
             mem.flush_threshold = 2;
 
-            mem.insert(1, "a".to_string())?;
-            mem.insert(2, "b".to_string())?;
-            mem.insert(3, "c".to_string())?;
-            mem.insert(4, "d".to_string())?;
+            mem.insert(k(1, 0), v("a"))?;
+            mem.insert(k(2, 0), v("b"))?;
+            mem.insert(k(3, 0), v("c"))?;
+            mem.insert(k(4, 0), v("d"))?;
 
             assert_eq!(mem.immutable_ssts.len(), 2);
             assert!(manifest_path.exists());
@@ -403,18 +404,18 @@ mod tests {
             let mem = Memtable::new(&wal_path)?;
             assert_eq!(mem.immutable_ssts.len(), 2);
             assert_eq!(mem.sst_id, 2);
-            assert_eq!(mem.get(&1)?, Some("a".to_string()));
-            assert_eq!(mem.get(&2)?, Some("b".to_string()));
-            assert_eq!(mem.get(&3)?, Some("c".to_string()));
-            assert_eq!(mem.get(&4)?, Some("d".to_string()));
+            assert_eq!(mem.get(&k(1, 0))?, Some(v("a")));
+            assert_eq!(mem.get(&k(2, 0))?, Some(v("b")));
+            assert_eq!(mem.get(&k(3, 0))?, Some(v("c")));
+            assert_eq!(mem.get(&k(4, 0))?, Some(v("d")));
             assert!(manifest_path.exists());
         }
 
         {
             let mem = Memtable::new(&wal_path)?;
             assert_eq!(mem.immutable_ssts.len(), 2);
-            assert_eq!(mem.get(&1)?, Some("a".to_string()));
-            assert_eq!(mem.get(&4)?, Some("d".to_string()));
+            assert_eq!(mem.get(&k(1, 0))?, Some(v("a")));
+            assert_eq!(mem.get(&k(4, 0))?, Some(v("d")));
         }
 
         Ok(())
@@ -428,30 +429,32 @@ mod tests {
         mem.flush_threshold = 2;
 
         for i in 0..8 {
-            mem.insert(i, format!("v{}", i))?;
+            let key = (vec![i as u8], i as i64);
+            mem.insert(key, format!("v{}", i).into_bytes())?;
         }
 
         assert_eq!(mem.immutable_ssts.len(), 1);
         assert_eq!(mem.immutable_ssts[0].entry_count(), 8);
 
         for i in 0..8 {
-            assert_eq!(mem.get(&i)?, Some(format!("v{}", i)));
+            let key = (vec![i as u8], i as i64);
+            assert_eq!(mem.get(&key)?, Some(format!("v{}", i).into_bytes()));
         }
 
-        mem.remove(3)?;
-        mem.remove(5)?;
-        mem.insert(8, "v8".to_string())?;
-        mem.insert(9, "v9".to_string())?;
+        mem.remove(k(3, 0))?;
+        mem.remove(k(5, 0))?;
+        mem.insert(k(8, 0), v("v8"))?;
+        mem.insert(k(9, 0), v("v9"))?;
 
         assert_eq!(mem.immutable_ssts.len(), 3);
         mem.compact()?;
         assert_eq!(mem.immutable_ssts.len(), 3);
 
-        assert_eq!(mem.get(&3)?, None);
-        assert_eq!(mem.get(&5)?, None);
-        assert_eq!(mem.get(&0)?, Some("v0".to_string()));
-        assert_eq!(mem.get(&8)?, Some("v8".to_string()));
-        assert_eq!(mem.get(&9)?, Some("v9".to_string()));
+        assert_eq!(mem.get(&k(3, 0))?, None);
+        assert_eq!(mem.get(&k(5, 0))?, None);
+        assert_eq!(mem.get(&k(0, 0))?, Some(v("v0")));
+        assert_eq!(mem.get(&k(8, 0))?, Some(v("v8")));
+        assert_eq!(mem.get(&k(9, 0))?, Some(v("v9")));
 
         Ok(())
     }

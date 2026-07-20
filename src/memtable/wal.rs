@@ -6,13 +6,16 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::memtable::SkipList;
+use crate::{
+    memtable::SkipList,
+    types::{Key, Value},
+};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum Operation<K, V> {
-    Insert { key: K, value: V },
-    Update { key: K, value: V },
-    Delete { key: K },
+pub enum Operation {
+    Insert { key: Key, value: Value },
+    Update { key: Key, value: Value },
+    Delete { key: Key },
 }
 
 pub struct Wal {
@@ -33,11 +36,7 @@ impl Wal {
         })
     }
 
-    pub fn append<K, V>(&mut self, op: &Operation<K, V>) -> io::Result<()>
-    where
-        K: Serialize,
-        V: Serialize,
-    {
+    pub fn append(&mut self, op: &Operation) -> io::Result<()> {
         let line =
             serde_json::to_string(op).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         self.writer.write_all(line.as_bytes())?;
@@ -45,11 +44,7 @@ impl Wal {
         Ok(())
     }
 
-    pub fn recover<K, V>(&self, skiplist: &mut SkipList<K, V>) -> io::Result<()>
-    where
-        K: for<'de> Deserialize<'de> + Ord + Clone + Default,
-        V: for<'de> Deserialize<'de> + Clone + Default,
-    {
+    pub fn recover(&self, skiplist: &mut SkipList) -> io::Result<()> {
         let file = File::open(&self.path)?;
         let reader = BufReader::new(file);
         for line in reader.lines() {
@@ -57,7 +52,7 @@ impl Wal {
             if line.is_empty() {
                 continue;
             }
-            let op: Operation<K, V> = serde_json::from_str(&line)
+            let op: Operation = serde_json::from_str(&line)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             match op {
                 Operation::Insert { key, value } | Operation::Update { key, value } => {
@@ -88,6 +83,13 @@ mod tests {
     use crate::memtable::SkipList;
     use tempfile::tempdir;
 
+    fn k(tag: u8, ts: i64) -> Key {
+        (vec![tag], ts)
+    }
+    fn v(s: &str) -> Value {
+        s.as_bytes().to_vec()
+    }
+
     #[test]
     fn test_wal_insert_and_recover() {
         let dir = tempdir().unwrap();
@@ -95,23 +97,23 @@ mod tests {
         let mut wal = Wal::new(&path).unwrap();
 
         wal.append(&Operation::Insert {
-            key: 1,
-            value: "one".to_string(),
+            key: k(1, 0),
+            value: v("one"),
         })
         .unwrap();
         wal.append(&Operation::Insert {
-            key: 2,
-            value: "two".to_string(),
+            key: k(2, 0),
+            value: v("two"),
         })
         .unwrap();
         wal.close().unwrap();
 
-        let mut list: SkipList<i32, String> = SkipList::new();
+        let mut list = SkipList::new();
         let wal_recover = Wal::new(&path).unwrap();
         wal_recover.recover(&mut list).unwrap();
 
-        assert_eq!(list.get(&1), Some(Some("one".to_string())));
-        assert_eq!(list.get(&2), Some(Some("two".to_string())));
+        assert_eq!(list.get(&k(1, 0)), Some(Some(v("one"))));
+        assert_eq!(list.get(&k(2, 0)), Some(Some(v("two"))));
         assert_eq!(list.len(), 2);
     }
 
@@ -122,24 +124,23 @@ mod tests {
         let mut wal = Wal::new(&path).unwrap();
 
         wal.append(&Operation::Insert {
-            key: 10,
-            value: "old".to_string(),
+            key: k(10, 0),
+            value: v("old"),
         })
         .unwrap();
         wal.append(&Operation::Update {
-            key: 10,
-            value: "new".to_string(),
+            key: k(10, 0),
+            value: v("new"),
         })
         .unwrap();
-        wal.append(&Operation::<i32, String>::Delete { key: 10 })
-            .unwrap();
+        wal.append(&Operation::Delete { key: k(10, 0) }).unwrap();
         wal.close().unwrap();
 
-        let mut list: SkipList<i32, String> = SkipList::new();
+        let mut list = SkipList::new();
         let wal_recover = Wal::new(&path).unwrap();
         wal_recover.recover(&mut list).unwrap();
 
-        assert_eq!(list.get(&10), Some(None));
+        assert_eq!(list.get(&k(10, 0)), Some(None));
         assert_eq!(list.len(), 1);
     }
 
@@ -149,7 +150,7 @@ mod tests {
         let path = dir.path().join("empty.log");
         Wal::new(&path).unwrap().close().unwrap();
 
-        let mut list: SkipList<i32, String> = SkipList::new();
+        let mut list = SkipList::new();
         let wal = Wal::new(&path).unwrap();
         wal.recover(&mut list).unwrap();
         assert_eq!(list.len(), 0);

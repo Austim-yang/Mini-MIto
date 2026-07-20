@@ -1,7 +1,6 @@
 use std::{
     fs::File,
     io,
-    marker::PhantomData,
     path::{Path, PathBuf},
     sync::Arc,
     vec,
@@ -14,35 +13,32 @@ use parquet::{
     file::properties::WriterProperties,
 };
 
-use crate::memtable::SkipList;
+use crate::{
+    memtable::SkipList,
+    types::{Key, Value},
+};
 
-pub struct SSTable<K, V> {
+pub struct SSTable {
     id: usize,
     path: PathBuf,
-    min_key: K,
-    max_key: K,
+    min_key: Key,
+    max_key: Key,
     entry_count: usize,
-    _marker: PhantomData<(K, V)>,
 }
 
-impl<K, V> SSTable<K, V>
-where
-    K: Ord + Clone + Default + serde::Serialize + for<'de> serde::Deserialize<'de>,
-    V: Clone + Default + serde::Serialize + for<'de> serde::Deserialize<'de>,
-{
-    pub fn new(id: usize, path: PathBuf, min_key: K, max_key: K, entry_count: usize) -> Self {
+impl SSTable {
+    pub fn new(id: usize, path: PathBuf, min_key: Key, max_key: Key, entry_count: usize) -> Self {
         SSTable {
             id,
             path,
             min_key,
             max_key,
             entry_count,
-            _marker: PhantomData,
         }
     }
 
     pub fn create_from_skiplist(
-        skiplist: &SkipList<K, V>,
+        skiplist: &SkipList,
         id: usize,
         path: impl AsRef<Path>,
         include_tombstones: bool,
@@ -111,7 +107,6 @@ where
             min_key,
             max_key,
             entry_count: count,
-            _marker: PhantomData,
         })
     }
 
@@ -132,7 +127,7 @@ where
                 .unwrap();
             for i in 0..batch.num_rows() {
                 let key_bytes = key_col.value(i);
-                let k: K = serde_json::from_slice(key_bytes)
+                let k: Key = serde_json::from_slice(key_bytes)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 if min_key.is_none() || k < *min_key.as_ref().unwrap() {
                     min_key = Some(k.clone());
@@ -162,7 +157,7 @@ where
         ))
     }
 
-    pub fn get(&self, key: &K) -> io::Result<Option<Option<V>>> {
+    pub fn get(&self, key: &Key) -> io::Result<Option<Option<Value>>> {
         if self.entry_count == 0 || key < &self.min_key || key > &self.max_key {
             return Ok(None);
         }
@@ -186,11 +181,11 @@ where
 
             for i in 0..batch.num_rows() {
                 let key_bytes = key_col.value(i);
-                let k: K = serde_json::from_slice(key_bytes)
+                let k: Key = serde_json::from_slice(key_bytes)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 if &k == key {
                     let val_bytes = value_col.value(i);
-                    let v: Option<V> = serde_json::from_slice(val_bytes)
+                    let v: Option<Value> = serde_json::from_slice(val_bytes)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                     return Ok(Some(v));
                 }
@@ -200,7 +195,7 @@ where
         Ok(None)
     }
 
-    pub fn scan(&self, start: &K, end: &K) -> io::Result<Vec<(K, Option<V>)>> {
+    pub fn scan(&self, start: &Key, end: &Key) -> io::Result<Vec<(Key, Option<Value>)>> {
         if self.entry_count == 0 || start > end || end < &self.min_key || start > &self.max_key {
             return Ok(Vec::new());
         }
@@ -225,11 +220,11 @@ where
 
             for i in 0..batch.num_rows() {
                 let key_bytes = key_col.value(i);
-                let k: K = serde_json::from_slice(key_bytes)
+                let k: Key = serde_json::from_slice(key_bytes)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 if k >= *start && k <= *end {
                     let val_bytes = value_col.value(i);
-                    let v: Option<V> = serde_json::from_slice(val_bytes)
+                    let v: Option<Value> = serde_json::from_slice(val_bytes)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                     results.push((k, v));
                 }
@@ -251,11 +246,11 @@ where
         self.entry_count
     }
 
-    pub fn min_key(&self) -> &K {
+    pub fn min_key(&self) -> &Key {
         &self.min_key
     }
 
-    pub fn max_key(&self) -> &K {
+    pub fn max_key(&self) -> &Key {
         &self.max_key
     }
 }
@@ -266,32 +261,39 @@ mod tests {
     use crate::memtable::SkipList;
     use tempfile::tempdir;
 
+    fn k(tag: u8, ts: i64) -> Key {
+        (vec![tag], ts)
+    }
+    fn v(s: &str) -> Value {
+        s.as_bytes().to_vec()
+    }
+
     #[test]
     fn test_sstable_create_and_get() -> io::Result<()> {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.sst");
 
         let mut skiplist = SkipList::new();
-        skiplist.insert(10, Some("ten".to_string()));
-        skiplist.insert(20, Some("twenty".to_string()));
-        skiplist.insert(30, Some("thirty".to_string()));
+        skiplist.insert(k(10, 0), Some(v("ten")));
+        skiplist.insert(k(20, 0), Some(v("twenty")));
+        skiplist.insert(k(30, 0), Some(v("thirty")));
 
         let sstable = SSTable::create_from_skiplist(&skiplist, 1, &path, true)?;
 
         assert_eq!(sstable.entry_count(), 3);
-        assert_eq!(sstable.min_key(), &10);
-        assert_eq!(sstable.max_key(), &30);
+        assert_eq!(sstable.min_key(), &k(10, 0));
+        assert_eq!(sstable.max_key(), &k(30, 0));
 
-        assert_eq!(sstable.get(&10)?.unwrap().as_deref(), Some("ten"));
-        assert_eq!(sstable.get(&20)?.unwrap().as_deref(), Some("twenty"));
-        assert_eq!(sstable.get(&30)?.unwrap().as_deref(), Some("thirty"));
+        assert_eq!(sstable.get(&k(10, 0))?.unwrap(), Some(v("ten")));
+        assert_eq!(sstable.get(&k(20, 0))?.unwrap(), Some(v("twenty")));
+        assert_eq!(sstable.get(&k(30, 0))?.unwrap(), Some(v("thirty")));
 
-        assert_eq!(sstable.get(&5)?, None);
-        assert_eq!(sstable.get(&25)?, None);
-        assert_eq!(sstable.get(&40)?, None);
+        assert_eq!(sstable.get(&k(5, 0))?, None);
+        assert_eq!(sstable.get(&k(25, 0))?, None);
+        assert_eq!(sstable.get(&k(40, 0))?, None);
 
-        assert_eq!(sstable.get(&10)?.unwrap().as_deref(), Some("ten"));
-        assert_eq!(sstable.get(&30)?.unwrap().as_deref(), Some("thirty"));
+        assert_eq!(sstable.get(&k(10, 0))?.unwrap(), Some(v("ten")));
+        assert_eq!(sstable.get(&k(30, 0))?.unwrap(), Some(v("thirty")));
 
         Ok(())
     }
@@ -302,31 +304,31 @@ mod tests {
         let path = dir.path().join("test_scan.sst");
 
         let mut skiplist = SkipList::new();
-        skiplist.insert(10, Some("ten".to_string()));
-        skiplist.insert(20, Some("twenty".to_string()));
-        skiplist.insert(30, Some("thirty".to_string()));
-        skiplist.insert(40, Some("forty".to_string()));
-        skiplist.insert(50, Some("fifty".to_string()));
+        skiplist.insert(k(10, 0), Some(v("ten")));
+        skiplist.insert(k(20, 0), Some(v("twenty")));
+        skiplist.insert(k(30, 0), Some(v("thirty")));
+        skiplist.insert(k(40, 0), Some(v("forty")));
+        skiplist.insert(k(50, 0), Some(v("fifty")));
 
         let sstable = SSTable::create_from_skiplist(&skiplist, 1, &path, true)?;
 
-        let result = sstable.scan(&20, &40)?;
+        let result = sstable.scan(&k(20, 0), &k(40, 0))?;
         assert_eq!(result.len(), 3);
-        assert_eq!(result[0].0, 20);
-        assert_eq!(result[1].0, 30);
-        assert_eq!(result[2].0, 40);
+        assert_eq!(result[0].0, k(20, 0));
+        assert_eq!(result[1].0, k(30, 0));
+        assert_eq!(result[2].0, k(40, 0));
 
-        let result = sstable.scan(&10, &10)?;
+        let result = sstable.scan(&k(10, 0), &k(10, 0))?;
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, 10);
+        assert_eq!(result[0].0, k(10, 0));
 
-        let result = sstable.scan(&1, &5)?;
+        let result = sstable.scan(&k(1, 0), &k(5, 0))?;
         assert!(result.is_empty());
 
-        let result = sstable.scan(&60, &70)?;
+        let result = sstable.scan(&k(60, 0), &k(70, 0))?;
         assert!(result.is_empty());
 
-        let result = sstable.scan(&30, &20)?;
+        let result = sstable.scan(&k(30, 0), &k(20, 0))?;
         assert!(result.is_empty());
 
         Ok(())
