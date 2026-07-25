@@ -1,0 +1,184 @@
+use std::hint::black_box;
+
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use mini_mito::{
+    Key, Memtable, Value,
+    memtable::{SkipList, Wal, wal::Operation},
+    sstable::sstable::SSTable,
+};
+use tempfile::tempdir;
+
+fn key(i: u64) -> Key {
+    (vec![i as u8], i as i64)
+}
+
+fn value(i: u64) -> Value {
+    format!("v{}", i).into_bytes()
+}
+
+fn build_skiplist(n: usize) -> SkipList {
+    let mut list = SkipList::new();
+    for i in 0..n {
+        list.insert(key(i as u64), Some(value(i as u64)));
+    }
+    list
+}
+
+fn bench_skiplist_insert(c: &mut Criterion) {
+    let mut group = c.benchmark_group("skiplist_bulk_insert");
+    for size in [100, 500, 1000, 5000, 10000].iter() {
+        group.throughput(Throughput::Elements(*size as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
+            b.iter(|| {
+                let mut list = SkipList::new();
+                for i in 0..size {
+                    list.insert(key(i), Some(value(i)));
+                }
+                black_box(list);
+            });
+        });
+    }
+    group.finish();
+}
+
+fn bench_memtable_insert(c: &mut Criterion) {
+    let mut group = c.benchmark_group("memtable_bulk_insert");
+    for size in [10, 50, 100, 500].iter() {
+        group.throughput(Throughput::Elements(*size as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
+            b.iter(|| {
+                let dir = tempdir().unwrap();
+                let wal_path = dir.path().join("wal.log");
+                let mut mem = Memtable::new(&wal_path).unwrap();
+                for i in 0..size {
+                    let _ = mem.insert(key(i), value(i));
+                }
+                black_box(mem);
+            });
+        });
+    }
+    group.finish();
+}
+
+fn bench_create_sstable(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sstable_create");
+    for size in [100, 500, 1000, 5000].iter() {
+        let approx_bytes = (*size as u64) * 50;
+        group.throughput(Throughput::Bytes(approx_bytes));
+        group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
+            b.iter(|| {
+                let list = build_skiplist(size);
+                let dir = tempdir().unwrap();
+                let path = dir.path().join("temp.sst");
+                let sst = SSTable::create_from_skiplist(&list, 0, &path, true).unwrap();
+                black_box(sst);
+            });
+        });
+    }
+    group.finish();
+}
+
+fn bench_sstable_scan(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sstable_scan");
+    for size in [100, 500, 1000, 5000].iter() {
+        let list = build_skiplist(*size);
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("scan.sst");
+        let sstable = SSTable::create_from_skiplist(&list, 0, &path, true).unwrap();
+        let min = sstable.min_key().clone();
+        let max = sstable.max_key().clone();
+
+        group.throughput(Throughput::Elements(*size as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(size), &sstable, |b, sst| {
+            b.iter(|| {
+                let results = sst.scan(&min, &max).unwrap();
+                black_box(results);
+            });
+        });
+    }
+    group.finish();
+}
+
+fn bench_compaction(c: &mut Criterion) {
+    let mut group = c.benchmark_group("compaction");
+    let per_sst_size = 100;
+    for num_ssts in [4, 8, 16].iter() {
+        let total_elements = (per_sst_size * num_ssts) as u64;
+        group.throughput(Throughput::Elements(total_elements));
+
+        let dir = tempdir().unwrap();
+        let mut sstables = Vec::new();
+        for id in 0..*num_ssts {
+            let mut list = SkipList::new();
+            let start = id * per_sst_size;
+            for i in 0..per_sst_size {
+                let key = key((start + i) as u64);
+                let value = value((start + i) as u64);
+                list.insert(key, Some(value));
+            }
+            let path = dir.path().join(format!("{}.sst", id));
+            let sst = SSTable::create_from_skiplist(&list, id as usize, &path, true).unwrap();
+            sstables.push(sst);
+        }
+
+        group.bench_with_input(
+            BenchmarkId::from_parameter(num_ssts),
+            &(dir.path().to_path_buf(), sstables),
+            |b, (dir, ssts)| {
+                b.iter(|| {
+                    let mut merged = SkipList::new();
+                    for sst in ssts {
+                        let pairs = sst.scan(sst.min_key(), sst.max_key()).unwrap();
+                        for (k, v) in pairs {
+                            merged.insert(k, v);
+                        }
+                    }
+                    let new_path = dir.join("merged.sst");
+                    let _new_sst =
+                        SSTable::create_from_skiplist(&merged, 999, &new_path, true).unwrap();
+                    black_box(merged);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+fn bench_wal_append_batch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("wal_bulk_append");
+    for batch_size in [10, 50, 100, 500].iter() {
+        let ops: Vec<Operation> = (0..*batch_size)
+            .map(|i| Operation::Insert {
+                key: key(i),
+                value: value(i),
+            })
+            .collect();
+        let approx_bytes = (*batch_size as u64) * 60;
+        group.throughput(Throughput::Bytes(approx_bytes));
+        group.bench_with_input(BenchmarkId::from_parameter(batch_size), &ops, |b, ops| {
+            b.iter(|| {
+                let dir = tempdir().unwrap();
+                let path = dir.path().join("test_wal.log");
+                let mut wal = Wal::new(&path).unwrap();
+                for op in ops {
+                    wal.append(op).unwrap();
+                }
+                wal.close().unwrap();
+                black_box(wal);
+            });
+        });
+    }
+    group.finish();
+}
+
+// ---------- 组合所有 benchmark ----------
+criterion_group!(
+    benches,
+    bench_skiplist_insert,
+    bench_memtable_insert,
+    bench_create_sstable,
+    bench_sstable_scan,
+    bench_compaction,
+    bench_wal_append_batch,
+);
+criterion_main!(benches);

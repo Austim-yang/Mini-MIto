@@ -98,6 +98,14 @@ impl Memtable {
         self.skiplist.len()
     }
 
+    pub fn skiplist(&self) -> &SkipList {
+        &self.skiplist
+    }
+
+    pub fn get_immutable_ssts(&self) -> &[SSTable] {
+        &self.immutable_ssts
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -266,6 +274,20 @@ impl Memtable {
 
     pub fn close(&mut self) -> io::Result<()> {
         self.wal.close()
+    }
+}
+
+use std::fmt;
+
+impl fmt::Debug for Memtable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Memtable")
+            .field("wal_path", &self.wal_path)
+            .field("flush_threshold", &self.flush_threshold)
+            .field("sst_id", &self.sst_id)
+            .field("immutable_ssts_count", &self.immutable_ssts.len())
+            .field("skiplist_len", &self.skiplist.len())
+            .finish()
     }
 }
 

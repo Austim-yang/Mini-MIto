@@ -1,0 +1,89 @@
+use std::hint::black_box;
+
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use mini_mito::{memtable::SkipList, sstable::sstable::SSTable};
+use rand::{RngExt, rng};
+use tempfile::tempdir;
+
+fn key(i: u64) -> (Vec<u8>, i64) {
+    (vec![i as u8], i as i64)
+}
+fn value(i: u64) -> Vec<u8> {
+    format!("v{}", i).into_bytes()
+}
+
+fn bench_sstable_create(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sstable_create");
+    for size in [1_000, 10_000, 100_000].iter() {
+        group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
+            b.iter_batched(
+                || {
+                    let mut list = SkipList::new();
+                    for i in 0..size {
+                        list.insert(key(i), Some(value(i)));
+                    }
+                    (list, tempdir().unwrap())
+                },
+                |(list, dir)| {
+                    let path = dir.path().join("test.sst");
+                    let _ = SSTable::create_from_skiplist(&list, 1, &path, true).unwrap();
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
+fn bench_sstable_get(c: &mut Criterion) {
+    let size = 10_000;
+    let mut list = SkipList::new();
+    for i in 0..size {
+        list.insert(key(i), Some(value(i)));
+    }
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test.sst");
+    let sst = SSTable::create_from_skiplist(&list, 1, &path, true).unwrap();
+    let mut rng = rng();
+
+    c.bench_function("sstable_get_hit", |b| {
+        b.iter(|| {
+            let idx = black_box(rng.random_range(0..size) as u64);
+            let _ = sst.get(&key(idx)).unwrap();
+        });
+    });
+    c.bench_function("sstable_get_miss", |b| {
+        b.iter(|| {
+            let idx = black_box(rng.random_range(size..(size * 2)) as u64);
+            let _ = sst.get(&key(idx)).unwrap();
+        });
+    });
+}
+
+fn bench_sstable_scan(c: &mut Criterion) {
+    let size = 10_000;
+    let mut list = SkipList::new();
+    for i in 0..size {
+        list.insert(key(i), Some(value(i)));
+    }
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test.sst");
+    let sst = SSTable::create_from_skiplist(&list, 1, &path, true).unwrap();
+
+    c.bench_function("sstable_scan_all", |b| {
+        b.iter(|| {
+            let _ = sst.scan(&key(0), &key(size - 1)).unwrap();
+        });
+    });
+
+    c.bench_function("sstable_scan_range_10pct", |b| {
+        b.iter(|| {
+            let start = black_box(size / 10);
+            let end = black_box(size / 10 * 2);
+            let _ = sst.scan(&key(start as u64), &key(end as u64)).unwrap();
+        });
+    });
+}
+
+criterion_group!(benches, bench_sstable_create, bench_sstable_get, bench_sstable_scan);
+criterion_main!(benches);
