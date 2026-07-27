@@ -14,8 +14,9 @@ impl SkipList {
     }
 
     pub fn insert(&mut self, key: Key, value: Option<Value>) -> Option<Value> {
-        let entry = self.inner.insert(key, value);
-        entry.value().clone()
+        let old_value = self.get(&key).unwrap_or(None);
+        self.inner.insert(key, value);
+        old_value
     }
 
     pub fn remove(&mut self, key: Key) -> Option<Value> {
