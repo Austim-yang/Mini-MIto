@@ -13,13 +13,13 @@ impl SkipList {
         }
     }
 
-    pub fn insert(&mut self, key: Key, value: Option<Value>) -> Option<Value> {
+    pub fn insert(&self, key: Key, value: Option<Value>) -> Option<Value> {
         let old_value = self.get(&key).unwrap_or(None);
         self.inner.insert(key, value);
         old_value
     }
 
-    pub fn remove(&mut self, key: Key) -> Option<Value> {
+    pub fn remove(&self, key: Key) -> Option<Value> {
         self.insert(key, None)
     }
 
@@ -62,7 +62,7 @@ mod tests {
 
     #[test]
     fn insert_multiple_reverse() {
-        let mut list = SkipList::new();
+        let list = SkipList::new();
         list.insert(k(3, 0), Some(v("c")));
         list.insert(k(2, 0), Some(v("b")));
         list.insert(k(1, 0), Some(v("a")));
@@ -70,7 +70,7 @@ mod tests {
 
     #[test]
     fn insert_update() {
-        let mut list = SkipList::new();
+        let list = SkipList::new();
         let old = list.insert(k(5, 0), Some(v("old")));
         assert_eq!(old, None);
         let old = list.insert(k(5, 0), Some(v("new")));
@@ -79,7 +79,7 @@ mod tests {
 
     #[test]
     fn test_get() {
-        let mut list = SkipList::new();
+        let list = SkipList::new();
         list.insert(k(5, 0), Some(v("hello")));
         assert_eq!(list.get(&k(5, 0)), Some(Some(v("hello"))));
         assert_eq!(list.get(&k(6, 0)), None);
@@ -87,7 +87,7 @@ mod tests {
 
     #[test]
     fn test_remove() {
-        let mut list = SkipList::new();
+        let list = SkipList::new();
         list.insert(k(5, 0), Some(v("hello")));
         list.insert(k(3, 0), Some(v("world")));
         assert_eq!(list.remove(k(5, 0)), Some(v("hello")));

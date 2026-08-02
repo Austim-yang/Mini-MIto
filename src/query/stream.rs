@@ -1,4 +1,5 @@
 use std::{
+    io,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -17,12 +18,12 @@ use datafusion::error::Result as DataFusionResult;
 use futures::Stream;
 
 use crate::{
-    memtable::memtable::Memtable,
+    memtable::memtable::MemtableManager,
     types::{Key, Value},
 };
 
 pub struct LSMStream {
-    memtable: Arc<Memtable>,
+    memtable_manager: Arc<MemtableManager>,
     schema: SchemaRef,
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
@@ -56,29 +57,12 @@ impl Stream for LSMStream {
 
 impl LSMStream {
     pub fn new(
-        memtable: Arc<Memtable>,
+        memtable_manager: Arc<MemtableManager>,
         schema: SchemaRef,
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
-    ) -> Self {
-        let mut merged = std::collections::BTreeMap::new();
-
-        for (key, value) in memtable.skiplist().iter() {
-            merged.insert(key, value);
-        }
-
-        let ssts = memtable.get_immutable_ssts();
-        for sst in ssts.iter().rev() {
-            let min_key = sst.min_key().clone();
-            let max_key = sst.max_key().clone();
-            if let Ok(pairs) = sst.scan(&min_key, &max_key) {
-                for (k, v) in pairs {
-                    if !merged.contains_key(&k) {
-                        merged.insert(k, v);
-                    }
-                }
-            }
-        }
+    ) -> io::Result<Self> {
+        let merged = memtable_manager.iter_all_data()?.collect::<Vec<_>>();
 
         let mut rows = Vec::new();
         for (key, value) in merged {
@@ -102,14 +86,14 @@ impl LSMStream {
             }
         }
 
-        Self {
-            memtable,
+        Ok(Self {
+            memtable_manager,
             schema,
             projection,
             limit,
             batches,
             index: 0,
-        }
+        })
     }
 
     fn build_record_batch(

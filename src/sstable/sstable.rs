@@ -18,6 +18,7 @@ use crate::{
     types::{Key, Value},
 };
 
+#[derive(Clone, Debug)]
 pub struct SSTable {
     id: usize,
     path: PathBuf,
@@ -143,10 +144,10 @@ impl SSTable {
         let id = path
             .as_ref()
             .file_stem()
-            .unwrap()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "sst file has no stem"))?
             .to_string_lossy()
             .parse::<usize>()
-            .unwrap();
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         Ok(SSTable::new(
             id,
@@ -273,7 +274,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.sst");
 
-        let mut skiplist = SkipList::new();
+        let skiplist = SkipList::new();
         skiplist.insert(k(10, 0), Some(v("ten")));
         skiplist.insert(k(20, 0), Some(v("twenty")));
         skiplist.insert(k(30, 0), Some(v("thirty")));
@@ -303,7 +304,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test_scan.sst");
 
-        let mut skiplist = SkipList::new();
+        let skiplist = SkipList::new();
         skiplist.insert(k(10, 0), Some(v("ten")));
         skiplist.insert(k(20, 0), Some(v("twenty")));
         skiplist.insert(k(30, 0), Some(v("thirty")));

@@ -18,7 +18,7 @@ fn bench_insert(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
             b.iter_batched(
                 || SkipList::new(),
-                |mut list| {
+                |list| {
                     for i in 0..size {
                         list.insert(key(black_box(i)), Some(value(black_box(i))));
                     }
@@ -33,7 +33,7 @@ fn bench_insert(c: &mut Criterion) {
 fn bench_get(c: &mut Criterion) {
     let mut group = c.benchmark_group("skiplist_get");
     let size = 10_000;
-    let mut list = SkipList::new();
+    let list = SkipList::new();
     for i in 0..size {
         list.insert(key(i), Some(value(i)));
     }
@@ -54,7 +54,7 @@ fn bench_get(c: &mut Criterion) {
 }
 
 fn bench_iter(c: &mut Criterion) {
-    let mut list = SkipList::new();
+    let list = SkipList::new();
     for i in 0..10_000 {
         list.insert(key(i), Some(value(i)));
     }

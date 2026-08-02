@@ -1,7 +1,7 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use mini_mito::Memtable;
+use mini_mito::MemtableManager;
 use tempfile::tempdir;
 
 fn key(i: u64) -> (Vec<u8>, i64) {
@@ -19,12 +19,12 @@ fn bench_memtable_insert(c: &mut Criterion) {
                 || {
                     let dir = tempdir().unwrap();
                     let path = dir.path().join("wal.log");
-                    let mem = Memtable::new(&path).unwrap();
+                    let mem = MemtableManager::new(&path).unwrap();
                     (mem, dir)
                 },
-                |(mut mem, _dir)| {
+                |(mem, _dir)| {
                     for i in 0..size {
-                        mem.insert(key(black_box(i)), value(black_box(i))).unwrap();
+                        mem.write(key(black_box(i)), value(black_box(i))).unwrap();
                     }
                 },
                 criterion::BatchSize::SmallInput,
@@ -40,13 +40,13 @@ fn bench_memtable_flush(c: &mut Criterion) {
             || {
                 let dir = tempdir().unwrap();
                 let path = dir.path().join("wal.log");
-                let mut mem = Memtable::new(&path).unwrap();
+                let mem = MemtableManager::new(&path).unwrap();
                 for i in 0..10_000 {
-                    mem.insert(key(i), value(i)).unwrap();
+                    mem.write(key(i), value(i)).unwrap();
                 }
                 (mem, dir)
             },
-            |(mut mem, _dir)| {
+            |(mem, _dir)| {
                 mem.flush().unwrap();
             },
             criterion::BatchSize::SmallInput,
@@ -60,13 +60,13 @@ fn bench_memtable_compact(c: &mut Criterion) {
             || {
                 let dir = tempdir().unwrap();
                 let path = dir.path().join("wal.log");
-                let mut mem = Memtable::new(&path).unwrap();
+                let mem = MemtableManager::new(&path).unwrap();
                 for i in 0..5000 {
-                    mem.insert(key(i), value(i)).unwrap();
+                    mem.write(key(i), value(i)).unwrap();
                 }
                 (mem, dir)
             },
-            |(mut mem, _dir)| {
+            |(mem, _dir)| {
                 mem.compact().unwrap();
             },
             criterion::BatchSize::SmallInput,

@@ -15,12 +15,12 @@ use datafusion::{
     },
 };
 
-use crate::memtable::memtable::Memtable;
+use crate::memtable::memtable::MemtableManager;
 use crate::query::stream::LSMStream;
 
 #[derive(Debug)]
 pub struct LSMScanExec {
-    memtable: Arc<Memtable>,
+    memtable_manager: Arc<MemtableManager>,
     schema: SchemaRef,
     projected_schema: SchemaRef,
     projection: Option<Vec<usize>>,
@@ -30,7 +30,7 @@ pub struct LSMScanExec {
 
 impl LSMScanExec {
     pub fn new(
-        memtable: Arc<Memtable>,
+        memtable_manager: Arc<MemtableManager>,
         schema: SchemaRef,
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
@@ -48,7 +48,7 @@ impl LSMScanExec {
             Boundedness::Bounded,
         ));
         Self {
-            memtable,
+            memtable_manager,
             schema,
             projected_schema,
             projection,
@@ -88,11 +88,11 @@ impl ExecutionPlan for LSMScanExec {
         }
 
         let stream = LSMStream::new(
-            self.memtable.clone(),
+            self.memtable_manager.clone(),
             self.projected_schema.clone(),
             self.projection.clone(),
             self.limit,
-        );
+        )?;
         Ok(Box::pin(stream) as SendableRecordBatchStream)
     }
 
@@ -104,7 +104,7 @@ impl ExecutionPlan for LSMScanExec {
 impl Clone for LSMScanExec {
     fn clone(&self) -> Self {
         Self {
-            memtable: self.memtable.clone(),
+            memtable_manager: self.memtable_manager.clone(),
             schema: self.schema.clone(),
             projected_schema: self.projected_schema.clone(),
             projection: self.projection.clone(),

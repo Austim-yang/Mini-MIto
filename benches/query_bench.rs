@@ -2,7 +2,7 @@ use std::{hint::black_box, sync::Arc};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion::execution::context::SessionContext;
-use mini_mito::{LSMTableProvider, Memtable};
+use mini_mito::{LSMTableProvider, MemtableManager};
 use tempfile::tempdir;
 use tokio::runtime::Runtime;
 
@@ -16,9 +16,9 @@ fn value(i: u64) -> Vec<u8> {
 fn setup_data(size: usize) -> (Arc<LSMTableProvider>, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
-    let mut mem = Memtable::new(&wal_path).unwrap();
+    let mem = MemtableManager::new(&wal_path).unwrap();
     for i in 0..size {
-        mem.insert(key(i as u64), value(i as u64)).unwrap();
+        mem.write(key(i as u64), value(i as u64)).unwrap();
     }
     let provider = LSMTableProvider::new(mem);
     (Arc::new(provider), dir)

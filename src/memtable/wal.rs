@@ -44,7 +44,7 @@ impl Wal {
         Ok(())
     }
 
-    pub fn recover(&self, skiplist: &mut SkipList) -> io::Result<()> {
+    pub fn recover(&self, skiplist: &SkipList) -> io::Result<()> {
         let file = File::open(&self.path)?;
         let reader = BufReader::new(file);
         for line in reader.lines() {

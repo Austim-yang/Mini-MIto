@@ -2,12 +2,20 @@ use std::{
     fs::{self},
     io::{self, BufRead, Write},
     path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    memtable::{SkipList, Wal, wal::Operation},
+    memtable::{
+        SkipList, Wal,
+        traits::{ImmutableMemtable, Memtable},
+        wal::Operation,
+    },
     sstable::sstable::SSTable,
     types::{Key, Value},
 };
@@ -21,106 +29,337 @@ pub struct ManifestEntry {
     entry_count: usize,
 }
 
-pub struct Memtable {
-    skiplist: SkipList,
-    wal: Wal,
+pub struct MutableSkipListMemtable {
+    inner: Arc<SkipList>,
+    wal: Arc<Mutex<Wal>>,
     wal_path: PathBuf,
-    flush_threshold: usize,
-    sst_id: usize,
-    immutable_ssts: Vec<SSTable>,
-    manifest_path: PathBuf,
 }
 
-impl Memtable {
+impl Memtable for MutableSkipListMemtable {
+    fn write(&self, key: Key, value: Option<Value>) -> io::Result<Option<Value>> {
+        let op = match &value {
+            Some(v) => Operation::Insert {
+                key: key.clone(),
+                value: v.clone(),
+            },
+            None => Operation::Delete { key: key.clone() },
+        };
+        self.wal.lock().unwrap().append(&op)?;
+        Ok(self.inner.insert(key, value))
+    }
+
+    fn write_batch(&self, entries: Vec<(Key, Option<Value>)>) -> io::Result<()> {
+        let mut wal_guard = self.wal.lock().unwrap();
+        for (key, value) in &entries {
+            let op = match value {
+                Some(v) => Operation::Insert {
+                    key: key.clone(),
+                    value: v.clone(),
+                },
+                None => Operation::Delete { key: key.clone() },
+            };
+            wal_guard.append(&op)?;
+        }
+        for (key, value) in entries {
+            self.inner.insert(key, value);
+        }
+        Ok(())
+    }
+
+    fn get(&self, key: &Key) -> io::Result<Option<Option<Value>>> {
+        Ok(self.inner.get(key))
+    }
+
+    fn scan(&self, start: &Key, end: &Key) -> io::Result<Vec<(Key, Option<Value>)>> {
+        let mut results = Vec::new();
+        for (k, v) in self.inner.iter() {
+            if &k >= start && &k <= end {
+                results.push((k, v));
+            }
+        }
+        Ok(results)
+    }
+
+    fn iter(&self) -> Box<dyn Iterator<Item = (Key, Option<Value>)> + '_> {
+        Box::new(self.inner.iter().map(|(k, v)| (k, v)))
+    }
+
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn estimated_size(&self) -> usize {
+        self.inner.len() * 64
+    }
+
+    fn freeze(&self) -> io::Result<Box<dyn ImmutableMemtable>> {
+        self.wal.lock().unwrap().close()?;
+        Ok(Box::new(ImmutableSkipListMemtable {
+            inner: self.inner.clone(),
+            wal_path: self.wal_path.clone(),
+        }))
+    }
+
+    fn fork(&self) -> io::Result<Box<dyn Memtable>> {
+        let parent = self.wal_path.parent().unwrap();
+        let stem = self.wal_path.file_stem().unwrap().to_str().unwrap();
+        let seq: usize = stem.trim_start_matches("wal_").parse().unwrap_or(0);
+        let new_seq = seq + 1;
+        let new_path = parent.join(format!("wal_{:03}.log", new_seq));
+        Ok(Box::new(MutableSkipListMemtable::new(new_path)?))
+    }
+
+    fn close(&self) -> io::Result<()> {
+        self.wal.lock().unwrap().close()
+    }
+}
+
+impl MutableSkipListMemtable {
+    fn new(wal_path: PathBuf) -> io::Result<Self> {
+        let wal = Wal::new(&wal_path)?;
+        let mut mem = Self {
+            inner: Arc::new(SkipList::new()),
+            wal: Arc::new(Mutex::new(wal)),
+            wal_path,
+        };
+        mem.wal.lock().unwrap().recover(&mut mem.inner)?;
+        Ok(mem)
+    }
+}
+
+use std::fmt;
+
+impl fmt::Debug for MutableSkipListMemtable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Memtable")
+            .field("wal_path", &self.wal_path)
+            .finish()
+    }
+}
+
+pub struct ImmutableSkipListMemtable {
+    inner: Arc<SkipList>,
+    wal_path: PathBuf,
+}
+
+impl ImmutableMemtable for ImmutableSkipListMemtable {
+    fn get(&self, key: &Key) -> io::Result<Option<Option<Value>>> {
+        Ok(self.inner.get(key))
+    }
+
+    fn scan(&self, start: &Key, end: &Key) -> io::Result<Vec<(Key, Option<Value>)>> {
+        let mut results = Vec::new();
+        for (k, v) in self.inner.iter() {
+            if &k >= start && &k <= end {
+                results.push((k, v));
+            }
+        }
+        Ok(results)
+    }
+
+    fn iter(&self) -> Box<dyn Iterator<Item = (Key, Option<Value>)> + '_> {
+        Box::new(self.inner.iter().map(|(k, v)| (k, v)))
+    }
+
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn estimated_size(&self) -> usize {
+        self.inner.len() * 64
+    }
+
+    fn to_sstable(&self, id: usize, path: &Path) -> io::Result<SSTable> {
+        SSTable::create_from_skiplist(&self.inner, id, path, true)
+    }
+
+    fn wal_path(&self) -> &Path {
+        &self.wal_path
+    }
+}
+
+pub struct MemtableManager {
+    active: Arc<RwLock<Option<Box<dyn Memtable>>>>,
+    immutables: Arc<RwLock<Vec<Box<dyn ImmutableMemtable>>>>,
+    sst_id: AtomicUsize,
+    base_dir: PathBuf,
+    max_memory_bytes: usize,
+    flush_threshold: usize,
+    manifest_path: PathBuf,
+    immutable_ssts: Arc<RwLock<Vec<SSTable>>>,
+}
+
+impl MemtableManager {
     pub fn new<P: AsRef<Path>>(wal_path: P) -> io::Result<Self> {
-        let manifest_path = wal_path
+        let base_dir = wal_path
             .as_ref()
             .parent()
             .unwrap_or(Path::new("."))
-            .join("manifest");
-        let mut mem = Memtable {
-            skiplist: SkipList::new(),
-            wal: Wal::new(&wal_path)?,
-            wal_path: wal_path.as_ref().to_path_buf(),
+            .to_path_buf();
+        let manifest_path = base_dir.join("manifest");
+        let initial_wal = base_dir.join("wal_000.log");
+        let active_mem = MutableSkipListMemtable::new(initial_wal)?;
+        let mut mgr = Self {
+            active: Arc::new(RwLock::new(Some(Box::new(active_mem)))),
+            immutables: Arc::new(RwLock::new(Vec::new())),
+            sst_id: AtomicUsize::new(0),
+            base_dir: base_dir.clone(),
+            max_memory_bytes: 1024 * 1024 * 10,
             flush_threshold: 1000,
-            sst_id: 0,
-            immutable_ssts: Vec::new(),
-            manifest_path,
+            manifest_path: manifest_path.clone(),
+            immutable_ssts: Arc::new(RwLock::new(Vec::new())),
         };
-        mem.load_manafest()?;
-        mem.wal.recover(&mut mem.skiplist)?;
-
-        Ok(mem)
+        mgr.load_manifest()?;
+        mgr.recover()?;
+        Ok(mgr)
     }
 
-    pub fn insert(&mut self, key: Key, value: Value) -> io::Result<Option<Value>> {
-        let op = Operation::Insert {
-            key: key.clone(),
-            value: value.clone(),
-        };
-        self.wal.append(&op)?;
-        let old_value = self.skiplist.insert(key, Some(value));
-        if self.skiplist.len() >= self.flush_threshold {
-            self.flush()?;
+    fn recover(&mut self) -> io::Result<()> {
+        let mut wal_files: Vec<PathBuf> = fs::read_dir(&self.base_dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name();
+                name.to_str()
+                    .map(|s| s.starts_with("wal_") && s.ends_with(".log"))
+                    .unwrap_or(false)
+            })
+            .map(|e| e.path())
+            .collect();
+        wal_files.sort();
+
+        if wal_files.is_empty() {
+            let new_wal = self.base_dir.join("wal_000.log");
+            let active = MutableSkipListMemtable::new(new_wal)?;
+            *self.active.write().unwrap() = Some(Box::new(active));
+            return Ok(());
         }
-        if self.immutable_ssts.len() >= 4 {
-            self.compact()?;
+
+        let last_wal = wal_files.pop().unwrap();
+        let found = self.scan_sst_files()?;
+
+        let active = MutableSkipListMemtable::new(last_wal)?;
+        *self.active.write().unwrap() = Some(Box::new(active));
+
+        self.merge_orphan_wals(&wal_files)?;
+        if !self.manifest_path.exists() || found > 0 {
+            self.write_manifest()?;
         }
-        Ok(old_value)
+        Ok(())
     }
 
-    pub fn get(&self, key: &Key) -> io::Result<Option<Value>> {
-        if let Some(value) = self.skiplist.get(key) {
-            return Ok(value);
+    fn merge_orphan_wals(&self, wal_files: &[PathBuf]) -> io::Result<()> {
+        let active_guard = self.active.read().unwrap();
+        let active = active_guard.as_ref().unwrap();
+        for path in wal_files {
+            let wal = Wal::new(path)?;
+            let skiplist = SkipList::new();
+            wal.recover(&skiplist)?;
+            if skiplist.is_empty() {
+                let _ = fs::remove_file(path);
+                continue;
+            }
+            for (key, value) in skiplist.iter() {
+                if active.get(&key)?.is_none() {
+                    active.write(key, value)?;
+                }
+            }
+            let _ = fs::remove_file(path);
         }
-        for sst in self.immutable_ssts.iter().rev() {
-            if let Some(value) = sst.get(key)? {
-                return Ok(value);
+        Ok(())
+    }
+
+    fn scan_sst_files(&mut self) -> io::Result<usize> {
+        let mut files: Vec<PathBuf> = fs::read_dir(&self.base_dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|s| s.ends_with(".sst"))
+                    .unwrap_or(false)
+            })
+            .map(|e| e.path())
+            .collect();
+
+        let mut ssts = self.immutable_ssts.write().unwrap();
+        let existing: Vec<PathBuf> = ssts.iter().map(|s| s.path().clone()).collect();
+
+        files.sort_by_key(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(usize::MAX)
+        });
+
+        let mut added = 0;
+        for path in files {
+            if existing.contains(&path) {
+                continue;
+            }
+            let is_numeric = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.parse::<usize>().is_ok())
+                .unwrap_or(false);
+            if !is_numeric {
+                continue;
+            }
+            let sst = SSTable::open_from_path(&path)?;
+            let current = self.sst_id.load(Ordering::SeqCst);
+            if sst.id() >= current {
+                self.sst_id.store(sst.id() + 1, Ordering::SeqCst);
+            }
+            ssts.push(sst);
+            added += 1;
+        }
+        ssts.sort_by_key(|s| s.id());
+        Ok(added)
+    }
+
+    fn load_manifest(&mut self) -> io::Result<()> {
+        if !self.manifest_path.exists() {
+            return Ok(());
+        }
+        let file = fs::File::open(&self.manifest_path)?;
+        let reader = io::BufReader::new(file);
+        let mut entries = Vec::new();
+        for line in reader.lines() {
+            let line = line?;
+            if line.is_empty() {
+                continue;
+            }
+            let entry: super::memtable::ManifestEntry = serde_json::from_str(&line)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            entries.push(entry);
+        }
+        entries.sort_by_key(|e| e.id);
+        let mut ssts = self.immutable_ssts.write().unwrap();
+        for entry in entries {
+            let path = self.base_dir.join(&entry.path);
+            if path.exists() {
+                let sst = SSTable::new(
+                    entry.id,
+                    path,
+                    entry.min_key,
+                    entry.max_key,
+                    entry.entry_count,
+                );
+                ssts.push(sst);
+                let current = self.sst_id.load(Ordering::SeqCst);
+                if entry.id >= current {
+                    self.sst_id.store(entry.id + 1, Ordering::SeqCst);
+                }
             }
         }
-        Ok(None)
-    }
-
-    pub fn remove(&mut self, key: Key) -> io::Result<Option<Value>> {
-        let op = Operation::Delete { key: key.clone() };
-        self.wal.append(&op)?;
-        let old_value = self.skiplist.remove(key);
-        if self.skiplist.len() >= self.flush_threshold {
-            self.flush()?;
-        }
-        if self.immutable_ssts.len() >= 4 {
-            self.compact()?;
-        }
-        Ok(old_value)
-    }
-
-    pub fn len(&self) -> usize {
-        self.skiplist.len()
-    }
-
-    pub fn skiplist(&self) -> &SkipList {
-        &self.skiplist
-    }
-
-    pub fn get_immutable_ssts(&self) -> &[SSTable] {
-        &self.immutable_ssts
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub fn flush_wal(&mut self) -> io::Result<()> {
-        self.wal.flush()
+        Ok(())
     }
 
     fn write_manifest(&self) -> io::Result<()> {
         let tmp_path = self.manifest_path.with_extension("tmp");
         let file = fs::File::create(&tmp_path)?;
         let mut writer = io::BufWriter::new(file);
-
-        for sst in &self.immutable_ssts {
-            let entry = ManifestEntry {
+        let ssts = self.immutable_ssts.read().unwrap();
+        for sst in ssts.iter() {
+            let entry = super::memtable::ManifestEntry {
                 id: sst.id(),
                 path: sst
                     .path()
@@ -140,159 +379,273 @@ impl Memtable {
         writer.flush()?;
         writer.get_ref().sync_all()?;
         fs::rename(&tmp_path, &self.manifest_path)?;
-
         Ok(())
     }
 
-    fn load_manafest(&mut self) -> io::Result<()> {
-        if !self.manifest_path.exists() {
-            self.scan_exist_ssts()?;
-            self.write_manifest()?;
-            return Ok(());
+    pub fn write(&self, key: Key, value: Value) -> io::Result<Option<Value>> {
+        self.write_inner(key, Some(value))
+    }
+
+    pub fn delete(&self, key: Key) -> io::Result<Option<Value>> {
+        self.write_inner(key, None)
+    }
+
+    pub fn write_batch(&self, entries: Vec<(Key, Option<Value>)>) -> io::Result<()> {
+        {
+            let active_opt = self.active.read().unwrap();
+            let active = active_opt.as_ref().unwrap();
+            active.write_batch(entries)?;
         }
-
-        let file = fs::File::open(&self.manifest_path)?;
-        let reader = io::BufReader::new(file);
-        let mut entries = Vec::new();
-
-        for line in reader.lines() {
-            let line = line?;
-            if line.is_empty() {
-                continue;
-            }
-            let entry: ManifestEntry = serde_json::from_str(&line)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            entries.push(entry);
-        }
-
-        entries.sort_by_key(|e| e.id);
-
-        for entry in entries {
-            let sst_path = self.wal_path.parent().unwrap().join(&entry.path);
-            let sst = SSTable::new(
-                entry.id,
-                sst_path,
-                entry.min_key,
-                entry.max_key,
-                entry.entry_count,
-            );
-
-            self.immutable_ssts.push(sst);
-            if entry.id >= self.sst_id {
-                self.sst_id = entry.id + 1;
-            }
-        }
-
+        self.maybe_flush()?;
         Ok(())
     }
 
-    fn scan_exist_ssts(&mut self) -> io::Result<()> {
-        let dir = self.wal_path.parent().unwrap_or(Path::new("."));
-        let mut entries = Vec::new();
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("sst") {
-                let file_name = path.file_stem().unwrap().to_string_lossy();
-                if let Ok(id) = file_name.parse::<usize>() {
-                    let sst = SSTable::open_from_path(&path)?;
-                    entries.push((id, sst));
+    fn write_inner(&self, key: Key, value: Option<Value>) -> io::Result<Option<Value>> {
+        let result = {
+            let active_opt = self.active.read().unwrap();
+            let active = active_opt.as_ref().unwrap();
+            active.write(key, value)?
+        };
+        self.maybe_flush()?;
+        Ok(result)
+    }
+
+    fn maybe_flush(&self) -> io::Result<()> {
+        let active_len = self
+            .active
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let total = self.estimated_total_memory();
+        if total > self.max_memory_bytes || active_len >= self.flush_threshold {
+            self.schedule_flush()?;
+        }
+        Ok(())
+    }
+
+    pub fn set_flush_threshold(&mut self, threshold: usize) {
+        self.flush_threshold = threshold;
+    }
+
+    pub fn sst_id(&self) -> usize {
+        self.sst_id.load(Ordering::SeqCst)
+    }
+
+    pub fn get(&self, key: Key) -> io::Result<Option<Value>> {
+        if let Some(active) = self.active.read().unwrap().as_ref() {
+            if let Some(v) = active.get(&key)? {
+                return Ok(v);
+            }
+        }
+
+        for imm in self.immutables.read().unwrap().iter().rev() {
+            if let Some(v) = imm.get(&key)? {
+                return Ok(v);
+            }
+        }
+
+        for sst in self.immutable_ssts.read().unwrap().iter().rev() {
+            if let Some(v) = sst.get(&key)? {
+                return Ok(v);
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn flush(&self) -> io::Result<()> {
+        self.schedule_flush()?;
+        Ok(())
+    }
+
+    fn schedule_flush(&self) -> io::Result<()> {
+        let (imm, wal_path) = {
+            let mut active_lock = self.active.write().unwrap();
+            let old_active = match active_lock.take() {
+                Some(a) => a,
+                None => return Ok(()),
+            };
+            if old_active.len() == 0 {
+                *active_lock = Some(old_active);
+                return Ok(());
+            }
+            let new_active = match old_active.fork() {
+                Ok(a) => a,
+                Err(e) => {
+                    *active_lock = Some(old_active);
+                    return Err(e);
                 }
-            }
-        }
-        entries.sort_by_key(|(id, _)| *id);
-        for (id, sst) in entries {
-            self.immutable_ssts.push(sst);
-            if id >= self.sst_id {
-                self.sst_id = id + 1;
-            }
-        }
+            };
+
+            let imm = match old_active.freeze() {
+                Ok(i) => i,
+                Err(e) => {
+                    *active_lock = Some(old_active);
+                    return Err(e);
+                }
+            };
+            *active_lock = Some(new_active);
+            let wal_path = imm.wal_path().to_path_buf();
+            (imm, wal_path)
+        };
+
+        self.immutables.write().unwrap().push(imm);
+        self.flush_immutables()?;
+        let _ = fs::remove_file(wal_path);
         Ok(())
     }
 
-    pub fn compact(&mut self) -> io::Result<()> {
-        if self.immutable_ssts.len() < 4 {
+    fn flush_immutables(&self) -> io::Result<()> {
+        let mut immutables = self.immutables.write().unwrap();
+        let mut new_ssts = Vec::new();
+        let mut ids_to_remove = Vec::new();
+        for (i, imm) in immutables.iter().enumerate() {
+            let id = self.sst_id.load(Ordering::SeqCst);
+            let path = self.base_dir.join(format!("{:04}.sst", id));
+            let sst = imm.to_sstable(id, &path)?;
+            new_ssts.push(sst);
+            ids_to_remove.push(i);
+            self.sst_id.fetch_add(1, Ordering::SeqCst);
+        }
+        for i in ids_to_remove.into_iter().rev() {
+            immutables.remove(i);
+        }
+        {
+            let mut ssts = self.immutable_ssts.write().unwrap();
+            ssts.extend(new_ssts);
+        }
+        self.write_manifest()?;
+        Ok(())
+    }
+
+    pub fn compact(&self) -> io::Result<()> {
+        let ssts = self.immutable_ssts.read().unwrap();
+        if ssts.len() < 4 {
             return Ok(());
         }
-
-        let mut temp_skiplist = SkipList::new();
-
-        for sst in &self.immutable_ssts {
+        let old_paths: Vec<PathBuf> = ssts.iter().map(|s| s.path().clone()).collect();
+        let merged_skiplist = SkipList::new();
+        for sst in ssts.iter() {
             let pairs = sst.scan(sst.min_key(), sst.max_key())?;
             for (k, v) in pairs {
-                temp_skiplist.insert(k, v);
+                merged_skiplist.insert(k, v);
             }
         }
-
-        let new_id = self.sst_id;
-        self.sst_id += 1;
-        let new_path = self
-            .wal_path
-            .parent()
-            .unwrap()
-            .join(format!("{:04}.sst", new_id));
-        let new_sst = SSTable::create_from_skiplist(&temp_skiplist, new_id, &new_path, false)?;
-        let new_list = vec![new_sst];
-        let old_ssts = std::mem::replace(&mut self.immutable_ssts, new_list);
+        drop(ssts);
+        let id = self.sst_id.load(Ordering::SeqCst);
+        let path = self.base_dir.join(format!("{:04}.sst", id));
+        let new_sst = SSTable::create_from_skiplist(&merged_skiplist, id, &path, true)?;
+        {
+            let mut ssts_w = self.immutable_ssts.write().unwrap();
+            *ssts_w = vec![new_sst];
+            self.sst_id.fetch_add(1, Ordering::SeqCst);
+        }
         self.write_manifest()?;
-
-        for sst in &old_ssts {
-            let _ = std::fs::remove_file(sst.path());
+        for p in old_paths {
+            let _ = fs::remove_file(p);
         }
-
         Ok(())
     }
 
-    pub fn flush(&mut self) -> io::Result<()> {
-        if self.skiplist.len() == 0 {
-            return Ok(());
-        }
-        let sst_filename = format!("{:04}.sst", self.sst_id);
-        let sst_path = self
-            .wal_path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join(sst_filename);
-        let sst = SSTable::create_from_skiplist(&self.skiplist, self.sst_id, &sst_path, true)?;
-        self.immutable_ssts.push(sst);
-        self.sst_id += 1;
-
-        if let Err(e) = self.write_manifest() {
-            let _ = fs::remove_file(&sst_path);
-            return Err(e);
-        }
-
-        self.skiplist = SkipList::new();
-        self.wal.close()?;
-        if self.wal_path.exists() {
-            fs::remove_file(&self.wal_path)?;
-        }
-        self.wal = Wal::new(&self.wal_path)?;
-
-        Ok(())
+    pub fn len(&self) -> usize {
+        let active_len = self
+            .active
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let imm_len: usize = self
+            .immutables
+            .read()
+            .unwrap()
+            .iter()
+            .map(|i| i.len())
+            .sum();
+        let sst_len: usize = self
+            .immutable_ssts
+            .read()
+            .unwrap()
+            .iter()
+            .map(|s| s.entry_count())
+            .sum();
+        active_len + imm_len + sst_len
     }
 
-    pub fn close(&mut self) -> io::Result<()> {
-        self.wal.close()
+    pub fn estimated_total_memory(&self) -> usize {
+        let active = self
+            .active
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|a| a.estimated_size())
+            .unwrap_or(0);
+        let imm: usize = self
+            .immutables
+            .read()
+            .unwrap()
+            .iter()
+            .map(|i| i.estimated_size())
+            .sum();
+        active + imm
+    }
+
+    pub fn get_immutable_ssts(&self) -> Vec<SSTable> {
+        self.immutable_ssts.read().unwrap().clone()
+    }
+
+    pub fn iter_all_data(&self) -> io::Result<impl Iterator<Item = (Key, Option<Value>)> + '_> {
+        use std::collections::BTreeMap;
+        let mut map = BTreeMap::new();
+        for sst in self.immutable_ssts.read().unwrap().iter().rev() {
+            let pairs = sst.scan(sst.min_key(), sst.max_key())?;
+            for (k, v) in pairs {
+                map.entry(k).or_insert(v);
+            }
+        }
+        for imm in self.immutables.read().unwrap().iter().rev() {
+            for (k, v) in imm.iter() {
+                map.entry(k).or_insert(v);
+            }
+        }
+        if let Some(active) = self.active.read().unwrap().as_ref() {
+            for (k, v) in active.iter() {
+                map.entry(k).or_insert(v);
+            }
+        }
+        Ok(map.into_iter())
+    }
+
+    pub fn close(&self) -> io::Result<()> {
+        if let Some(active) = self.active.read().unwrap().as_ref() {
+            active.close()?;
+        }
+        Ok(())
     }
 }
 
-use std::fmt;
-
-impl fmt::Debug for Memtable {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Memtable")
-            .field("wal_path", &self.wal_path)
+impl std::fmt::Debug for MemtableManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemtableManager")
+            .field("sst_id", &self.sst_id.load(Ordering::SeqCst))
+            .field("base_dir", &self.base_dir)
+            .field("max_memory_bytes", &self.max_memory_bytes)
             .field("flush_threshold", &self.flush_threshold)
-            .field("sst_id", &self.sst_id)
-            .field("immutable_ssts_count", &self.immutable_ssts.len())
-            .field("skiplist_len", &self.skiplist.len())
+            .field(
+                "immutable_ssts_count",
+                &self.immutable_ssts.read().unwrap().len(),
+            )
+            .field("immutables_count", &self.immutables.read().unwrap().len())
             .finish()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::assert_eq;
+
     use super::*;
     use tempfile::tempdir;
 
@@ -307,26 +660,25 @@ mod tests {
     fn test_memtable_insert_get_remove() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.log");
-        let mut mem = Memtable::new(&path).unwrap();
-        assert!(mem.is_empty());
-        assert_eq!(mem.len(), 0);
+        let mgr = MemtableManager::new(&path).unwrap();
+        assert_eq!(mgr.len(), 0);
 
-        assert_eq!(mem.insert(k(1, 0), v("one")).unwrap(), None);
-        assert_eq!(mem.insert(k(2, 0), v("two")).unwrap(), None);
-        assert_eq!(mem.len(), 2);
+        assert_eq!(mgr.write(k(1, 0), v("one")).unwrap(), None);
+        assert_eq!(mgr.write(k(2, 0), v("two")).unwrap(), None);
+        assert_eq!(mgr.len(), 2);
 
-        assert_eq!(mem.get(&k(1, 0)).unwrap(), Some(v("one")));
-        assert_eq!(mem.get(&k(3, 0)).unwrap(), None);
+        assert_eq!(mgr.get(k(1, 0)).unwrap(), Some(v("one")));
+        assert_eq!(mgr.get(k(3, 0)).unwrap(), None);
 
-        assert_eq!(mem.insert(k(1, 0), v("uno")).unwrap(), Some(v("one")));
-        assert_eq!(mem.get(&k(1, 0)).unwrap(), Some(v("uno")));
+        assert_eq!(mgr.write(k(1, 0), v("uno")).unwrap(), Some(v("one")));
+        assert_eq!(mgr.get(k(1, 0)).unwrap(), Some(v("uno")));
 
-        assert_eq!(mem.remove(k(2, 0)).unwrap(), Some(v("two")));
-        assert_eq!(mem.len(), 2);
-        assert_eq!(mem.get(&k(2, 0)).unwrap(), None);
-        assert_eq!(mem.remove(k(3, 0)).unwrap(), None);
+        assert_eq!(mgr.delete(k(2, 0)).unwrap(), Some(v("two")));
+        assert_eq!(mgr.len(), 2);
+        assert_eq!(mgr.get(k(2, 0)).unwrap(), None);
+        assert_eq!(mgr.delete(k(3, 0)).unwrap(), None);
 
-        mem.close().unwrap();
+        mgr.close().unwrap();
     }
 
     #[test]
@@ -335,17 +687,17 @@ mod tests {
         let path = dir.path().join("test.log");
 
         {
-            let mut mem = Memtable::new(&path).unwrap();
-            mem.insert(k(1, 0), v("one")).unwrap();
-            mem.insert(k(2, 0), v("two")).unwrap();
-            mem.close().unwrap();
+            let mgr = MemtableManager::new(&path).unwrap();
+            mgr.write(k(1, 0), v("one")).unwrap();
+            mgr.write(k(2, 0), v("two")).unwrap();
+            mgr.close().unwrap();
         }
 
         {
-            let mem = Memtable::new(&path).unwrap();
-            assert_eq!(mem.len(), 2);
-            assert_eq!(mem.get(&k(1, 0)).unwrap(), Some(v("one")));
-            assert_eq!(mem.get(&k(2, 0)).unwrap(), Some(v("two")));
+            let mgr = MemtableManager::new(&path).unwrap();
+            assert_eq!(mgr.len(), 2);
+            assert_eq!(mgr.get(k(1, 0)).unwrap(), Some(v("one")));
+            assert_eq!(mgr.get(k(2, 0)).unwrap(), Some(v("two")));
         }
     }
 
@@ -355,14 +707,14 @@ mod tests {
         let path = dir.path().join("empty.log");
 
         {
-            let mut mem = Memtable::new(&path).unwrap();
-            assert!(mem.is_empty());
-            mem.close().unwrap();
+            let mgr = MemtableManager::new(&path).unwrap();
+            assert_eq!(mgr.len(), 0);
+            mgr.close().unwrap();
         }
 
         {
-            let mem = Memtable::new(&path).unwrap();
-            assert!(mem.is_empty());
+            let mgr = MemtableManager::new(&path).unwrap();
+            assert_eq!(mgr.len(), 0);
         }
     }
 
@@ -370,32 +722,32 @@ mod tests {
     fn test_memtable_flush() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.log");
-        let mut mem = Memtable::new(&path).unwrap();
-        mem.insert(k(1, 0), v("one")).unwrap();
-        mem.flush_wal().unwrap();
-        mem.close().unwrap();
+        let mgr = MemtableManager::new(&path).unwrap();
+        mgr.write(k(1, 0), v("one")).unwrap();
+        mgr.flush().unwrap();
+        mgr.close().unwrap();
 
-        let mem2 = Memtable::new(&path).unwrap();
-        assert_eq!(mem2.get(&k(1, 0)).unwrap(), Some(v("one")));
+        let mgr2 = MemtableManager::new(&path).unwrap();
+        assert_eq!(mgr2.get(k(1, 0)).unwrap(), Some(v("one")));
     }
 
     #[test]
     fn test_memtable_flush_multiple() -> io::Result<()> {
         let dir = tempdir().unwrap();
         let wal_path = dir.path().join("wal.log");
-        let mut mem = Memtable::new(&wal_path)?;
-        mem.flush_threshold = 2;
+        let mut mgr = MemtableManager::new(&wal_path)?;
+        mgr.set_flush_threshold(2);
 
-        mem.insert(k(1, 0), v("a"))?;
-        mem.insert(k(2, 0), v("b"))?;
-        assert_eq!(mem.immutable_ssts.len(), 1);
+        mgr.write(k(1, 0), v("a"))?;
+        mgr.write(k(2, 0), v("b"))?;
+        assert_eq!(mgr.get_immutable_ssts().len(), 1);
 
-        mem.insert(k(3, 0), v("c"))?;
-        mem.insert(k(4, 0), v("d"))?;
-        assert_eq!(mem.immutable_ssts.len(), 2);
+        mgr.write(k(3, 0), v("c"))?;
+        mgr.write(k(4, 0), v("d"))?;
+        assert_eq!(mgr.get_immutable_ssts().len(), 2);
 
-        assert_eq!(mem.get(&k(1, 0)).unwrap(), Some(v("a")));
-        assert_eq!(mem.get(&k(4, 0)).unwrap(), Some(v("d")));
+        assert_eq!(mgr.get(k(1, 0))?, Some(v("a")));
+        assert_eq!(mgr.get(k(4, 0))?, Some(v("d")));
         Ok(())
     }
 
@@ -406,38 +758,38 @@ mod tests {
         let manifest_path = dir.path().join("manifest");
 
         {
-            let mut mem = Memtable::new(&wal_path)?;
-            mem.flush_threshold = 2;
+            let mut mgr = MemtableManager::new(&wal_path)?;
+            mgr.set_flush_threshold(2);
 
-            mem.insert(k(1, 0), v("a"))?;
-            mem.insert(k(2, 0), v("b"))?;
-            mem.insert(k(3, 0), v("c"))?;
-            mem.insert(k(4, 0), v("d"))?;
+            mgr.write(k(1, 0), v("a"))?;
+            mgr.write(k(2, 0), v("b"))?;
+            mgr.write(k(3, 0), v("c"))?;
+            mgr.write(k(4, 0), v("d"))?;
 
-            assert_eq!(mem.immutable_ssts.len(), 2);
+            mgr.flush()?;
+            assert!(mgr.get_immutable_ssts().len() >= 2);
             assert!(manifest_path.exists());
-            mem.close()?;
+            mgr.close()?;
         }
 
         fs::remove_file(&manifest_path)?;
         assert!(!manifest_path.exists());
 
         {
-            let mem = Memtable::new(&wal_path)?;
-            assert_eq!(mem.immutable_ssts.len(), 2);
-            assert_eq!(mem.sst_id, 2);
-            assert_eq!(mem.get(&k(1, 0))?, Some(v("a")));
-            assert_eq!(mem.get(&k(2, 0))?, Some(v("b")));
-            assert_eq!(mem.get(&k(3, 0))?, Some(v("c")));
-            assert_eq!(mem.get(&k(4, 0))?, Some(v("d")));
+            let mgr = MemtableManager::new(&wal_path)?;
+            assert!(mgr.get_immutable_ssts().len() >= 2);
+            assert_eq!(mgr.get(k(1, 0))?, Some(v("a")));
+            assert_eq!(mgr.get(k(2, 0))?, Some(v("b")));
+            assert_eq!(mgr.get(k(3, 0))?, Some(v("c")));
+            assert_eq!(mgr.get(k(4, 0))?, Some(v("d")));
             assert!(manifest_path.exists());
         }
 
         {
-            let mem = Memtable::new(&wal_path)?;
-            assert_eq!(mem.immutable_ssts.len(), 2);
-            assert_eq!(mem.get(&k(1, 0))?, Some(v("a")));
-            assert_eq!(mem.get(&k(4, 0))?, Some(v("d")));
+            let mgr = MemtableManager::new(&wal_path)?;
+            assert!(mgr.get_immutable_ssts().len() >= 2);
+            assert_eq!(mgr.get(k(1, 0))?, Some(v("a")));
+            assert_eq!(mgr.get(k(4, 0))?, Some(v("d")));
         }
 
         Ok(())
@@ -447,36 +799,45 @@ mod tests {
     fn test_compaction() -> io::Result<()> {
         let dir = tempdir().unwrap();
         let wal_path = dir.path().join("wal.log");
-        let mut mem = Memtable::new(&wal_path)?;
-        mem.flush_threshold = 2;
+        let mut mgr = MemtableManager::new(&wal_path)?;
+        mgr.set_flush_threshold(2);
 
         for i in 0..8 {
             let key = (vec![i as u8], i as i64);
-            mem.insert(key, format!("v{}", i).into_bytes())?;
+            mgr.write(key, format!("v{}", i).into_bytes())?;
         }
-
-        assert_eq!(mem.immutable_ssts.len(), 1);
-        assert_eq!(mem.immutable_ssts[0].entry_count(), 8);
+        assert_eq!(mgr.get_immutable_ssts().len(), 4);
 
         for i in 0..8 {
             let key = (vec![i as u8], i as i64);
-            assert_eq!(mem.get(&key)?, Some(format!("v{}", i).into_bytes()));
+            assert_eq!(mgr.get(key)?, Some(format!("v{}", i).into_bytes()));
         }
 
-        mem.remove(k(3, 0))?;
-        mem.remove(k(5, 0))?;
-        mem.insert(k(8, 0), v("v8"))?;
-        mem.insert(k(9, 0), v("v9"))?;
+        mgr.compact()?;
+        assert_eq!(mgr.get_immutable_ssts().len(), 1);
 
-        assert_eq!(mem.immutable_ssts.len(), 3);
-        mem.compact()?;
-        assert_eq!(mem.immutable_ssts.len(), 3);
+        for i in 0..8 {
+            let key = (vec![i as u8], i as i64);
+            assert_eq!(mgr.get(key)?, Some(format!("v{}", i).into_bytes()));
+        }
 
-        assert_eq!(mem.get(&k(3, 0))?, None);
-        assert_eq!(mem.get(&k(5, 0))?, None);
-        assert_eq!(mem.get(&k(0, 0))?, Some(v("v0")));
-        assert_eq!(mem.get(&k(8, 0))?, Some(v("v8")));
-        assert_eq!(mem.get(&k(9, 0))?, Some(v("v9")));
+        mgr.delete(k(3, 0))?;
+        mgr.delete(k(5, 0))?;
+        mgr.write(k(8, 0), v("v8"))?;
+        mgr.write(k(9, 0), v("v9"))?;
+        mgr.write(k(10, 0), v("v10"))?;
+        mgr.write(k(11, 0), v("v11"))?;
+        assert_eq!(mgr.get_immutable_ssts().len(), 4);
+        mgr.compact()?;
+        assert_eq!(mgr.get_immutable_ssts().len(), 1);
+
+        assert_eq!(mgr.get(k(3, 0))?, None);
+        assert_eq!(mgr.get(k(5, 0))?, None);
+        assert_eq!(mgr.get(k(0, 0))?, Some(v("v0")));
+        assert_eq!(mgr.get(k(8, 0))?, Some(v("v8")));
+        assert_eq!(mgr.get(k(9, 0))?, Some(v("v9")));
+        assert_eq!(mgr.get(k(10, 0))?, Some(v("v10")));
+        assert_eq!(mgr.get(k(11, 0))?, Some(v("v11")));
 
         Ok(())
     }

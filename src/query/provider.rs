@@ -10,7 +10,7 @@ use datafusion::{
 
 use datafusion::error::Result as DataFusionResult;
 
-use crate::{memtable::memtable::Memtable, query::scan::LSMScanExec};
+use crate::{memtable::memtable::MemtableManager, query::scan::LSMScanExec};
 
 pub const TAGS_COL: usize = 0;
 pub const TIMESTAMP_COL: usize = 1;
@@ -26,14 +26,14 @@ fn lsm_schema() -> SchemaRef {
 
 #[derive(Debug)]
 pub struct LSMTableProvider {
-    memtable: Arc<Memtable>,
+    memtable_manager: Arc<MemtableManager>,
     schema: SchemaRef,
 }
 
 impl LSMTableProvider {
-    pub fn new(memtable: Memtable) -> Self {
+    pub fn new(memtable_manager: MemtableManager) -> Self {
         Self {
-            memtable: Arc::new(memtable),
+            memtable_manager: Arc::new(memtable_manager),
             schema: lsm_schema(),
         }
     }
@@ -62,7 +62,7 @@ impl TableProvider for LSMTableProvider {
         'life3: 'async_trait,
         Self: 'async_trait,
     {
-        let memtable = self.memtable.clone();
+        let memtable = self.memtable_manager.clone();
         let schema = self.schema.clone();
         let projection = projection.cloned();
 

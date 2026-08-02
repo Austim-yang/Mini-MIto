@@ -2,7 +2,7 @@ use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use mini_mito::{
-    Key, Memtable, Value,
+    Key, MemtableManager, Value,
     memtable::{SkipList, Wal, wal::Operation},
     sstable::sstable::SSTable,
 };
@@ -17,7 +17,7 @@ fn value(i: u64) -> Value {
 }
 
 fn build_skiplist(n: usize) -> SkipList {
-    let mut list = SkipList::new();
+    let list = SkipList::new();
     for i in 0..n {
         list.insert(key(i as u64), Some(value(i as u64)));
     }
@@ -30,7 +30,7 @@ fn bench_skiplist_insert(c: &mut Criterion) {
         group.throughput(Throughput::Elements(*size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
             b.iter(|| {
-                let mut list = SkipList::new();
+                let list = SkipList::new();
                 for i in 0..size {
                     list.insert(key(i), Some(value(i)));
                 }
@@ -49,9 +49,9 @@ fn bench_memtable_insert(c: &mut Criterion) {
             b.iter(|| {
                 let dir = tempdir().unwrap();
                 let wal_path = dir.path().join("wal.log");
-                let mut mem = Memtable::new(&wal_path).unwrap();
+                let mem = MemtableManager::new(&wal_path).unwrap();
                 for i in 0..size {
-                    let _ = mem.insert(key(i), value(i));
+                    let _ = mem.write(key(i), value(i));
                 }
                 black_box(mem);
             });
@@ -109,7 +109,7 @@ fn bench_compaction(c: &mut Criterion) {
         let dir = tempdir().unwrap();
         let mut sstables = Vec::new();
         for id in 0..*num_ssts {
-            let mut list = SkipList::new();
+            let list = SkipList::new();
             let start = id * per_sst_size;
             for i in 0..per_sst_size {
                 let key = key((start + i) as u64);
@@ -126,7 +126,7 @@ fn bench_compaction(c: &mut Criterion) {
             &(dir.path().to_path_buf(), sstables),
             |b, (dir, ssts)| {
                 b.iter(|| {
-                    let mut merged = SkipList::new();
+                    let merged = SkipList::new();
                     for sst in ssts {
                         let pairs = sst.scan(sst.min_key(), sst.max_key()).unwrap();
                         for (k, v) in pairs {

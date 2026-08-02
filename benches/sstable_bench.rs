@@ -18,7 +18,7 @@ fn bench_sstable_create(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
             b.iter_batched(
                 || {
-                    let mut list = SkipList::new();
+                    let list = SkipList::new();
                     for i in 0..size {
                         list.insert(key(i), Some(value(i)));
                     }
@@ -37,7 +37,7 @@ fn bench_sstable_create(c: &mut Criterion) {
 
 fn bench_sstable_get(c: &mut Criterion) {
     let size = 10_000;
-    let mut list = SkipList::new();
+    let list = SkipList::new();
     for i in 0..size {
         list.insert(key(i), Some(value(i)));
     }
@@ -62,7 +62,7 @@ fn bench_sstable_get(c: &mut Criterion) {
 
 fn bench_sstable_scan(c: &mut Criterion) {
     let size = 10_000;
-    let mut list = SkipList::new();
+    let list = SkipList::new();
     for i in 0..size {
         list.insert(key(i), Some(value(i)));
     }
