@@ -6,7 +6,7 @@ use std::{
     vec,
 };
 
-use arrow::array::{ArrayRef, BinaryArray, RecordBatch};
+use arrow::array::{Array, ArrayRef, BinaryArray, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use parquet::{
     arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
@@ -17,6 +17,18 @@ use crate::{
     memtable::SkipList,
     types::{Key, Value},
 };
+
+const TAG_COL: usize = 0;
+const TS_COL: usize = 1;
+const FIELDS_COL: usize = 2;
+
+fn sst_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("tags", DataType::Binary, false),
+        Field::new("timestamp", DataType::Int64, false),
+        Field::new("fields", DataType::Binary, true),
+    ])
+}
 
 #[derive(Clone, Debug)]
 pub struct SSTable {
@@ -44,8 +56,9 @@ impl SSTable {
         path: impl AsRef<Path>,
         include_tombstones: bool,
     ) -> io::Result<Self> {
-        let mut keys_bytes = Vec::new();
-        let mut values_bytes = Vec::new();
+        let mut tag_buf = Vec::with_capacity(skiplist.len());
+        let mut ts_buf = Vec::with_capacity(skiplist.len());
+        let mut field_buf = Vec::with_capacity(skiplist.len());
         let mut min_key = None;
         let mut max_key = None;
         let mut count = 0;
@@ -54,45 +67,34 @@ impl SSTable {
             if !include_tombstones && value.is_none() {
                 continue;
             }
-            let key_json = serde_json::to_vec(&key)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let value_json = serde_json::to_vec(&value)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            keys_bytes.push(key_json);
-            values_bytes.push(value_json);
-
             if min_key.is_none() || key < *min_key.as_ref().unwrap() {
                 min_key = Some(key.clone());
             }
             if max_key.is_none() || key > *max_key.as_ref().unwrap() {
                 max_key = Some(key.clone());
             }
+            let (tags, ts) = key;
+            tag_buf.push(tags);
+            ts_buf.push(ts);
+            field_buf.push(value);
             count += 1;
         }
 
-        let min_key = min_key.unwrap_or_default();
-        let max_key = max_key.unwrap_or_default();
-
-        let schema = Schema::new(vec![
-            Field::new("key", DataType::Binary, false),
-            Field::new("value", DataType::Binary, false),
-        ]);
-
-        let key_array = BinaryArray::from_iter_values(keys_bytes.iter().map(|v| v.as_slice()));
-        let value_array = BinaryArray::from_iter_values(values_bytes.iter().map(|v| v.as_slice()));
-
         let batch = RecordBatch::try_new(
-            Arc::new(schema.clone()),
+            Arc::new(sst_schema()),
             vec![
-                Arc::new(key_array) as ArrayRef,
-                Arc::new(value_array) as ArrayRef,
+                Arc::new(BinaryArray::from_iter_values(tag_buf)) as ArrayRef,
+                Arc::new(Int64Array::from_iter_values(ts_buf)) as ArrayRef,
+                Arc::new(BinaryArray::from_iter(
+                    field_buf.iter().map(|o| o.as_deref()),
+                )) as ArrayRef,
             ],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         let file = File::create(path.as_ref())?;
         let props = WriterProperties::builder().build();
-        let mut writer = ArrowWriter::try_new(file, Arc::new(schema), Some(props))
+        let mut writer = ArrowWriter::try_new(file, Arc::new(sst_schema()), Some(props))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         writer
@@ -105,8 +107,8 @@ impl SSTable {
         Ok(SSTable {
             id,
             path: path.as_ref().to_path_buf(),
-            min_key,
-            max_key,
+            min_key: min_key.unwrap_or_default(),
+            max_key: max_key.unwrap_or_default(),
             entry_count: count,
         })
     }
@@ -116,20 +118,25 @@ impl SSTable {
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let mut reader = builder.build()?;
-        let mut min_key = None;
-        let mut max_key = None;
+        let mut min_key: Option<Key> = None;
+        let mut max_key: Option<Key> = None;
         let mut count = 0;
         while let Some(batch) = reader.next() {
-            let batch = batch.unwrap();
-            let key_col = batch
-                .column(0)
+            let batch = batch
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+                .unwrap();
+            let tags = batch
+                .column(TAG_COL)
                 .as_any()
                 .downcast_ref::<BinaryArray>()
                 .unwrap();
+            let ts = batch
+                .column(TS_COL)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
             for i in 0..batch.num_rows() {
-                let key_bytes = key_col.value(i);
-                let k: Key = serde_json::from_slice(key_bytes)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let k = (tags.value(i).to_vec(), ts.value(i));
                 if min_key.is_none() || k < *min_key.as_ref().unwrap() {
                     min_key = Some(k.clone());
                 }
@@ -139,8 +146,6 @@ impl SSTable {
                 count += 1;
             }
         }
-        let min_key = min_key.unwrap_or_default();
-        let max_key = max_key.unwrap_or_default();
         let id = path
             .as_ref()
             .file_stem()
@@ -152,8 +157,8 @@ impl SSTable {
         Ok(SSTable::new(
             id,
             path.as_ref().to_path_buf(),
-            min_key,
-            max_key,
+            min_key.unwrap_or_default(),
+            max_key.unwrap_or_default(),
             count,
         ))
     }
@@ -164,30 +169,36 @@ impl SSTable {
         }
 
         let file = File::open(&self.path).unwrap();
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            .unwrap();
         let mut reader = builder.build()?;
 
         while let Some(batch_result) = reader.next() {
             let batch = batch_result.unwrap();
-            let key_col = batch
-                .column(0)
+            let tags = batch
+                .column(TAG_COL)
                 .as_any()
                 .downcast_ref::<BinaryArray>()
                 .expect("key column must be BinaryArray");
-            let value_col = batch
-                .column(1)
+            let ts = batch
+                .column(TS_COL)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value column must be Int64Array");
+            let fields = batch
+                .column(FIELDS_COL)
                 .as_any()
                 .downcast_ref::<BinaryArray>()
                 .expect("value column must be BinaryArray");
 
             for i in 0..batch.num_rows() {
-                let key_bytes = key_col.value(i);
-                let k: Key = serde_json::from_slice(key_bytes)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                if &k == key {
-                    let val_bytes = value_col.value(i);
-                    let v: Option<Value> = serde_json::from_slice(val_bytes)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let k = (tags.value(i).to_vec(), ts.value(i));
+                if k > *key {
+                    return Ok(None);
+                }
+                if k == *key {
+                    let v = (!fields.is_null(i)).then(|| fields.value(i).to_vec());
                     return Ok(Some(v));
                 }
             }
@@ -202,31 +213,37 @@ impl SSTable {
         }
 
         let file = File::open(&self.path).unwrap();
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            .unwrap();
         let mut reader = builder.build()?;
 
         let mut results = Vec::new();
         while let Some(batch_result) = reader.next() {
             let batch = batch_result.unwrap();
-            let key_col = batch
-                .column(0)
+            let tags = batch
+                .column(TAG_COL)
                 .as_any()
                 .downcast_ref::<BinaryArray>()
                 .expect("key column must be BinaryArray");
-            let value_col = batch
-                .column(1)
+            let ts = batch
+                .column(TS_COL)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value column must be Int64Array");
+            let fields = batch
+                .column(FIELDS_COL)
                 .as_any()
                 .downcast_ref::<BinaryArray>()
                 .expect("value column must be BinaryArray");
 
             for i in 0..batch.num_rows() {
-                let key_bytes = key_col.value(i);
-                let k: Key = serde_json::from_slice(key_bytes)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                if k >= *start && k <= *end {
-                    let val_bytes = value_col.value(i);
-                    let v: Option<Value> = serde_json::from_slice(val_bytes)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let k = (tags.value(i).to_vec(), ts.value(i));
+                if k > *end {
+                    return Ok(results);
+                }
+                if k >= *start {
+                    let v = (!fields.is_null(i)).then(|| fields.value(i).to_vec());
                     results.push((k, v));
                 }
             }
@@ -332,6 +349,48 @@ mod tests {
         let result = sstable.scan(&k(30, 0), &k(20, 0))?;
         assert!(result.is_empty());
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_sstable_arrow_native_schema() -> io::Result<()> {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("native.sst");
+        let list = SkipList::new();
+        list.insert((vec![1], 100), Some(v("a")));
+        list.insert((vec![1], 200), None);
+        list.insert((vec![2], 100), Some(v("b")));
+
+        SSTable::create_from_skiplist(&list, 1, &path, true)?;
+
+        let file = File::open(&path)?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let mut reader = builder.build()?;
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.schema().fields().len(), 3);
+        assert_eq!(batch.schema().field(1).data_type(), &DataType::Int64);
+        assert!(batch.column(2).is_null(1));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sstable_tombstone_roundtrip() -> io::Result<()> {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("1.sst");
+        let list = SkipList::new();
+        list.insert((vec![1], 10), Some(v("a")));
+        list.insert((vec![1], 20), None);
+        let sst = SSTable::create_from_skiplist(&list, 1, &path, true)?;
+
+        assert_eq!(sst.get(&(vec![1], 20))?.unwrap(), None);
+        assert_eq!(sst.get(&(vec![1], 10))?.unwrap(), Some(v("a")));
+        assert_eq!(sst.get(&(vec![9], 99))?, None);
+
+        let reopened = SSTable::open_from_path(&path)?;
+        assert_eq!(reopened.min_key(), &(vec![1], 10));
+        assert_eq!(reopened.max_key(), &(vec![1], 20));
+        assert_eq!(reopened.entry_count(), 2);
         Ok(())
     }
 }
