@@ -1,8 +1,7 @@
 use std::{sync::Arc, vec};
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, StringArray,
-    TimestampNanosecondArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, TimestampNanosecondArray,
 };
 use arrow_schema::{DataType, Field, Schema};
 
@@ -186,42 +185,80 @@ impl TableSchema {
     }
 }
 
-pub(crate) fn parse_column_cells(dt: &DataType, arr: &ArrayRef, n: usize) -> Vec<Option<Vec<u8>>> {
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        let cell = match dt {
-            DataType::Binary => {
-                let a = arr.as_any().downcast_ref::<BinaryArray>().unwrap();
-                (!a.is_null(i)).then(|| a.value(i).to_vec())
-            }
-            DataType::Utf8 => {
-                let a = arr.as_any().downcast_ref::<StringArray>().unwrap();
-                (!a.is_null(i)).then(|| a.value(i).as_bytes().to_vec())
-            }
-            DataType::Int64 => {
-                let a = arr.as_any().downcast_ref::<Int64Array>().unwrap();
-                (!a.is_null(i)).then(|| a.value(i).to_le_bytes().to_vec())
-            }
-            DataType::Float64 => {
-                let a = arr.as_any().downcast_ref::<Float64Array>().unwrap();
-                (!a.is_null(i)).then(|| a.value(i).to_le_bytes().to_vec())
-            }
-            DataType::Boolean => {
-                let a = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
-                (!a.is_null(i)).then(|| vec![a.value(i) as u8])
-            }
+pub(crate) enum ColumnView<'a> {
+    Binary(&'a BinaryArray),
+    Utf8(&'a StringArray),
+    Int64(&'a Int64Array),
+    Float64(&'a Float64Array),
+    Boolean(&'a BooleanArray),
+    Timestamp(&'a TimestampNanosecondArray),
+}
+
+impl<'a> ColumnView<'a> {
+    fn from_array(arr: &'a ArrayRef, dt: &DataType) -> Self {
+        match dt {
+            DataType::Binary => Self::Binary(arr.as_any().downcast_ref::<BinaryArray>().unwrap()),
+            DataType::Utf8 => Self::Utf8(arr.as_any().downcast_ref::<StringArray>().unwrap()),
+            DataType::Int64 => Self::Int64(arr.as_any().downcast_ref::<Int64Array>().unwrap()),
+            DataType::Float64 => Self::Float64(arr.as_any().downcast_ref::<Float64Array>().unwrap()),
+            DataType::Boolean => Self::Boolean(arr.as_any().downcast_ref::<BooleanArray>().unwrap()),
             DataType::Timestamp(..) => {
-                let a = arr
-                    .as_any()
-                    .downcast_ref::<TimestampNanosecondArray>()
-                    .unwrap();
-                (!a.is_null(i)).then(|| a.value(i).to_le_bytes().to_vec())
+                Self::Timestamp(arr.as_any().downcast_ref::<TimestampNanosecondArray>().unwrap())
             }
-            other => unimplemented!("cell encoding for {other:?}"),
-        };
-        out.push(cell);
+            other => unimplemented!("column view for {other:?}"),
+        }
     }
-    out
+
+    fn is_null(&self, i: usize) -> bool {
+        match self {
+            Self::Binary(a) => a.is_null(i),
+            Self::Utf8(a) => a.is_null(i),
+            Self::Int64(a) => a.is_null(i),
+            Self::Float64(a) => a.is_null(i),
+            Self::Boolean(a) => a.is_null(i),
+            Self::Timestamp(a) => a.is_null(i),
+        }
+    }
+
+    fn cell(&self, i: usize) -> Option<Vec<u8>> {
+        match self {
+            Self::Binary(a) => (!a.is_null(i)).then(|| a.value(i).to_vec()),
+            Self::Utf8(a) => (!a.is_null(i)).then(|| a.value(i).as_bytes().to_vec()),
+            Self::Int64(a) => (!a.is_null(i)).then(|| a.value(i).to_le_bytes().to_vec()),
+            Self::Float64(a) => (!a.is_null(i)).then(|| a.value(i).to_le_bytes().to_vec()),
+            Self::Boolean(a) => (!a.is_null(i)).then(|| vec![a.value(i) as u8]),
+            Self::Timestamp(a) => (!a.is_null(i)).then(|| a.value(i).to_le_bytes().to_vec()),
+        }
+    }
+}
+
+pub(crate) struct BatchView<'a> {
+    cols: Vec<ColumnView<'a>>,
+}
+
+impl<'a> BatchView<'a> {
+    pub fn new(batch: &'a RecordBatch, schema: &TableSchema) -> Self {
+        let cols = (0..schema.columns.len())
+            .map(|c| ColumnView::from_array(batch.column(c), &schema.columns[c].data_type))
+            .collect();
+        Self { cols }
+    }
+
+    pub fn cell(&self, col: usize, i: usize) -> Option<Vec<u8>> {
+        self.cols[col].cell(i)
+    }
+
+    pub fn is_null(&self, col: usize, i: usize) -> bool {
+        self.cols[col].is_null(i)
+    }
+
+    pub fn ts_value(&self, col: usize, i: usize) -> i64 {
+        match &self.cols[col] {
+            ColumnView::Int64(a) => a.value(i),
+            ColumnView::Timestamp(a) => a.value(i),
+            _ => unreachable!("time index column must be Int64 or Timestamp"),
+        }
+    }
 }
 
 pub(crate) fn cells_to_array(dt: &DataType, rows: &[Option<Vec<u8>>]) -> ArrayRef {

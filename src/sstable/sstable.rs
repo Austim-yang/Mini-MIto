@@ -14,42 +14,44 @@ use parquet::{
 
 use crate::{
     memtable::SkipList,
-    schema::{SemanticType, TableSchema, cells_to_array, parse_column_cells},
+    schema::{BatchView, SemanticType, TableSchema, cells_to_array},
     types::{Key, Value},
 };
 
-fn key_at(cols: &[Vec<Option<Vec<u8>>>], schema: &TableSchema, i: usize) -> Key {
-    let row: Vec<Vec<u8>> = (0..schema.columns.len())
-        .map(|c| cols[c][i].clone().unwrap_or_default())
-        .collect();
-    schema.cells_to_key(&row)
+fn key_at(view: &BatchView, schema: &TableSchema, i: usize) -> Key {
+    let tags = if schema.primary_key.len() == 1 {
+        view.cell(schema.primary_key[0], i).unwrap_or_default()
+    } else {
+        let mut cells = vec![Vec::new(); schema.columns.len()];
+        for &idx in &schema.primary_key {
+            cells[idx] = view.cell(idx, i).unwrap_or_default();
+        }
+        schema.encode_tags(&cells)
+    };
+    let ts = view.ts_value(schema.time_index, i);
+    (tags, ts)
 }
 
-fn value_at(cols: &[Vec<Option<Vec<u8>>>], schema: &TableSchema, i: usize) -> Option<Value> {
-    let tombstone = schema
-        .columns
-        .iter()
-        .enumerate()
-        .any(|(c, col)| col.semantic == SemanticType::Field && cols[c][i].is_none());
-    if tombstone {
+fn value_at(
+    view: &BatchView,
+    schema: &TableSchema,
+    field_cols: &[usize],
+    i: usize,
+) -> Option<Value> {
+    if field_cols.is_empty() {
+        return Some(Vec::new());
+    }
+    if field_cols.iter().any(|&c| view.is_null(c, i)) {
         return None;
     }
-    let row: Vec<Vec<u8>> = (0..schema.columns.len())
-        .map(|c| cols[c][i].clone().unwrap_or_default())
-        .collect();
-    Some(schema.encode_fields(&row))
-}
-
-fn parse_batch(batch: &RecordBatch, schema: &TableSchema) -> Vec<Vec<Option<Vec<u8>>>> {
-    (0..schema.columns.len())
-        .map(|c| {
-            parse_column_cells(
-                &schema.columns[c].data_type,
-                batch.column(c),
-                batch.num_rows(),
-            )
-        })
-        .collect()
+    if field_cols.len() == 1 {
+        return view.cell(field_cols[0], i);
+    }
+    let mut cells = vec![Vec::new(); schema.columns.len()];
+    for &c in field_cols {
+        cells[c] = view.cell(c, i).unwrap_or_default();
+    }
+    Some(schema.encode_fields(&cells))
 }
 
 #[derive(Clone, Debug)]
@@ -94,22 +96,52 @@ impl SSTable {
         let mut max_key = None;
         let mut count = 0;
 
+        let nfields = schema
+            .columns
+            .iter()
+            .filter(|c| c.semantic == SemanticType::Field)
+            .count();
+        let single_field_col = (nfields == 1).then(|| {
+            schema
+                .columns
+                .iter()
+                .position(|c| c.semantic == SemanticType::Field)
+                .unwrap()
+        });
+
         for (key, value) in skiplist.iter() {
             if !include_tombstones && value.is_none() {
                 continue;
             }
-            let cells = schema.key_to_cells(&key);
-            let decoded = value.as_ref().map(|blob| schema.decode_fields(blob));
-            let mut field_index = 0;
-            for (i, col) in schema.columns.iter().enumerate() {
-                if col.semantic == SemanticType::Field {
-                    cols[i].push(match (&value, &decoded) {
-                        (Some(_), Some(fcells)) => Some(fcells[field_index].clone()),
-                        _ => None,
-                    });
-                    field_index += 1;
-                } else {
-                    cols[i].push(Some(cells[i].clone()));
+            if schema.primary_key.len() == 1 {
+                cols[schema.primary_key[0]].push(Some(key.0.clone()));
+            } else {
+                let tags = schema.decode_tags(&key.0);
+                for (j, &idx) in schema.primary_key.iter().enumerate() {
+                    cols[idx].push(Some(tags[j].clone()));
+                }
+            }
+            cols[schema.time_index].push(Some(key.1.to_le_bytes().to_vec()));
+            match value {
+                Some(blob) => match single_field_col {
+                    Some(idx) => cols[idx].push(Some(blob.clone())),
+                    None => {
+                        let fcells = schema.decode_fields(&blob);
+                        let mut k = 0;
+                        for (i, col) in schema.columns.iter().enumerate() {
+                            if col.semantic == SemanticType::Field {
+                                cols[i].push(Some(fcells[k].clone()));
+                                k += 1;
+                            }
+                        }
+                    }
+                },
+                None => {
+                    for (i, col) in schema.columns.iter().enumerate() {
+                        if col.semantic == SemanticType::Field {
+                            cols[i].push(None);
+                        }
+                    }
                 }
             }
             if min_key.is_none() || key < *min_key.as_ref().unwrap() {
@@ -159,9 +191,9 @@ impl SSTable {
         let mut count = 0;
         for batch in reader {
             let batch = batch.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let cols = parse_batch(&batch, schema);
+            let view = BatchView::new(&batch, schema);
             for i in 0..batch.num_rows() {
-                let k = key_at(&cols, schema, i);
+                let k = key_at(&view, schema, i);
                 if min_key.is_none() || k < *min_key.as_ref().unwrap() {
                     min_key = Some(k.clone());
                 }
@@ -201,15 +233,23 @@ impl SSTable {
 
         for batch_result in reader {
             let batch = batch_result.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let cols = parse_batch(&batch, &self.schema);
+            let view = BatchView::new(&batch, &self.schema);
+            let field_cols: Vec<usize> = self
+                .schema
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.semantic == SemanticType::Field)
+                .map(|(c, _)| c)
+                .collect();
 
             for i in 0..batch.num_rows() {
-                let k = key_at(&cols, &self.schema, i);
+                let k = key_at(&view, &self.schema, i);
                 if k > *key {
                     return Ok(None);
                 }
                 if k == *key {
-                    return Ok(Some(value_at(&cols, &self.schema, i)));
+                    return Ok(Some(value_at(&view, &self.schema, &field_cols, i)));
                 }
             }
         }
@@ -230,15 +270,23 @@ impl SSTable {
         let mut results = Vec::new();
         for batch_result in reader {
             let batch = batch_result.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let cols = parse_batch(&batch, &self.schema);
+            let view = BatchView::new(&batch, &self.schema);
+            let field_cols: Vec<usize> = self
+                .schema
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.semantic == SemanticType::Field)
+                .map(|(c, _)| c)
+                .collect();
 
             for i in 0..batch.num_rows() {
-                let k = key_at(&cols, &self.schema, i);
+                let k = key_at(&view, &self.schema, i);
                 if k > *end {
                     return Ok(results);
                 }
                 if k >= *start {
-                    results.push((k, value_at(&cols, &self.schema, i)));
+                    results.push((k, value_at(&view, &self.schema, &field_cols, i)));
                 }
             }
         }
@@ -318,16 +366,25 @@ impl SSTableIter {
                 None => return Ok(false),
                 Some(batch) => {
                     let batch = batch?;
-                    let cols = parse_batch(&batch, &self.schema);
+                    let view = BatchView::new(&batch, &self.schema);
+                    let field_cols: Vec<usize> = self
+                        .schema
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| c.semantic == SemanticType::Field)
+                        .map(|(c, _)| c)
+                        .collect();
                     self.current.clear();
                     self.pos = 0;
                     for i in 0..batch.num_rows() {
-                        let k = key_at(&cols, &self.schema, i);
+                        let k = key_at(&view, &self.schema, i);
                         if k > self.end {
                             break;
                         }
                         if k >= self.start {
-                            self.current.push((k, value_at(&cols, &self.schema, i)));
+                            self.current
+                                .push((k, value_at(&view, &self.schema, &field_cols, i)));
                         }
                     }
                 }
@@ -354,8 +411,8 @@ impl Iterator for SSTableIter {
 mod tests {
     use super::*;
     use crate::{memtable::SkipList, schema::ColumnDef};
-    use tempfile::tempdir;
     use arrow_schema::DataType;
+    use tempfile::tempdir;
 
     fn k(tag: u8, ts: i64) -> Key {
         (vec![tag], ts)
