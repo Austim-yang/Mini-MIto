@@ -67,19 +67,17 @@ impl MergeIter {
 impl Iterator for MergeIter {
     type Item = (Key, Option<Value>);
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let top = self.heap.pop()?.0;
-            while let Some(Reverse(e)) = self.heap.peek() {
-                if e.key == top.key {
-                    let dup = self.heap.pop().unwrap().0;
-                    self.push_source(dup.src);
-                } else {
-                    break;
-                }
+        let top = self.heap.pop()?.0;
+        while let Some(Reverse(e)) = self.heap.peek() {
+            if e.key == top.key {
+                let dup = self.heap.pop().unwrap().0;
+                self.push_source(dup.src);
+            } else {
+                break;
             }
-            self.push_source(top.src);
-            return Some((top.key, top.value));
         }
+        self.push_source(top.src);
+        Some((top.key, top.value))
     }
 }
 

@@ -16,6 +16,7 @@ use crate::{
         traits::{ImmutableMemtable, Memtable},
         wal::Operation,
     },
+    schema::TableSchema,
     sstable::sstable::SSTable,
     types::{Key, Value},
 };
@@ -81,7 +82,7 @@ impl Memtable for MutableSkipListMemtable {
     }
 
     fn iter(&self) -> Box<dyn Iterator<Item = (Key, Option<Value>)> + '_> {
-        Box::new(self.inner.iter().map(|(k, v)| (k, v)))
+        Box::new(self.inner.iter())
     }
 
     fn len(&self) -> usize {
@@ -117,12 +118,12 @@ impl Memtable for MutableSkipListMemtable {
 impl MutableSkipListMemtable {
     fn new(wal_path: PathBuf) -> io::Result<Self> {
         let wal = Wal::new(&wal_path)?;
-        let mut mem = Self {
+        let mem = Self {
             inner: Arc::new(SkipList::new()),
             wal: Arc::new(Mutex::new(wal)),
             wal_path,
         };
-        mem.wal.lock().unwrap().recover(&mut mem.inner)?;
+        mem.wal.lock().unwrap().recover(&mem.inner)?;
         Ok(mem)
     }
 }
@@ -158,7 +159,7 @@ impl ImmutableMemtable for ImmutableSkipListMemtable {
     }
 
     fn iter(&self) -> Box<dyn Iterator<Item = (Key, Option<Value>)> + '_> {
-        Box::new(self.inner.iter().map(|(k, v)| (k, v)))
+        Box::new(self.inner.iter())
     }
 
     fn len(&self) -> usize {
@@ -169,8 +170,8 @@ impl ImmutableMemtable for ImmutableSkipListMemtable {
         self.inner.len() * 64
     }
 
-    fn to_sstable(&self, id: usize, path: &Path) -> io::Result<SSTable> {
-        SSTable::create_from_skiplist(&self.inner, id, path, true)
+    fn to_sstable(&self, id: usize, path: &Path, schema: &TableSchema) -> io::Result<SSTable> {
+        SSTable::create_from_skiplist(&self.inner, id, path, true, schema)
     }
 
     fn wal_path(&self) -> &Path {
@@ -187,10 +188,15 @@ pub struct MemtableManager {
     flush_threshold: usize,
     manifest_path: PathBuf,
     immutable_ssts: Arc<RwLock<Vec<SSTable>>>,
+    schema: Arc<TableSchema>,
 }
 
 impl MemtableManager {
     pub fn new<P: AsRef<Path>>(wal_path: P) -> io::Result<Self> {
+        Self::with_schema(wal_path, Arc::new(TableSchema::default_table()))
+    }
+
+    pub fn with_schema<P: AsRef<Path>>(wal_path: P, schema: Arc<TableSchema>) -> io::Result<Self> {
         let base_dir = wal_path
             .as_ref()
             .parent()
@@ -208,10 +214,15 @@ impl MemtableManager {
             flush_threshold: 1000,
             manifest_path: manifest_path.clone(),
             immutable_ssts: Arc::new(RwLock::new(Vec::new())),
+            schema,
         };
         mgr.load_manifest()?;
         mgr.recover()?;
         Ok(mgr)
+    }
+
+    pub fn schema(&self) -> Arc<TableSchema> {
+        self.schema.clone()
     }
 
     fn recover(&mut self) -> io::Result<()> {
@@ -303,7 +314,7 @@ impl MemtableManager {
             if !is_numeric {
                 continue;
             }
-            let sst = SSTable::open_from_path(&path)?;
+            let sst = SSTable::open_from_path(&path, &self.schema)?;
             let current = self.sst_id.load(Ordering::SeqCst);
             if sst.id() >= current {
                 self.sst_id.store(sst.id() + 1, Ordering::SeqCst);
@@ -342,6 +353,7 @@ impl MemtableManager {
                     entry.min_key,
                     entry.max_key,
                     entry.entry_count,
+                    self.schema.clone(),
                 );
                 ssts.push(sst);
                 let current = self.sst_id.load(Ordering::SeqCst);
@@ -434,10 +446,10 @@ impl MemtableManager {
     }
 
     pub fn get(&self, key: Key) -> io::Result<Option<Value>> {
-        if let Some(active) = self.active.read().unwrap().as_ref() {
-            if let Some(v) = active.get(&key)? {
-                return Ok(v);
-            }
+        if let Some(active) = self.active.read().unwrap().as_ref()
+            && let Some(v) = active.get(&key)?
+        {
+            return Ok(v);
         }
 
         for imm in self.immutables.read().unwrap().iter().rev() {
@@ -504,7 +516,7 @@ impl MemtableManager {
         for (i, imm) in immutables.iter().enumerate() {
             let id = self.sst_id.load(Ordering::SeqCst);
             let path = self.base_dir.join(format!("{:04}.sst", id));
-            let sst = imm.to_sstable(id, &path)?;
+            let sst = imm.to_sstable(id, &path, &self.schema)?;
             new_ssts.push(sst);
             ids_to_remove.push(i);
             self.sst_id.fetch_add(1, Ordering::SeqCst);
@@ -536,7 +548,8 @@ impl MemtableManager {
         drop(ssts);
         let id = self.sst_id.load(Ordering::SeqCst);
         let path = self.base_dir.join(format!("{:04}.sst", id));
-        let new_sst = SSTable::create_from_skiplist(&merged_skiplist, id, &path, true)?;
+        let new_sst =
+            SSTable::create_from_skiplist(&merged_skiplist, id, &path, true, &self.schema)?;
         {
             let mut ssts_w = self.immutable_ssts.write().unwrap();
             *ssts_w = vec![new_sst];
@@ -622,11 +635,12 @@ impl MemtableManager {
         &self,
     ) -> io::Result<Vec<Box<dyn Iterator<Item = (Key, Option<Value>)>>>> {
         let mut out: Vec<Box<dyn Iterator<Item = (Key, Option<Value>)>>> = Vec::new();
-        if let Some(active) = self.active.read().unwrap().as_ref() {
-            if active.len() > 0 {
-                out.push(Box::new(active.iter().collect::<Vec<_>>().into_iter()));
-            }
+        if let Some(active) = self.active.read().unwrap().as_ref()
+            && active.len() > 0
+        {
+            out.push(Box::new(active.iter().collect::<Vec<_>>().into_iter()));
         }
+
         for imm in self.immutables.read().unwrap().iter().rev() {
             if imm.len() > 0 {
                 out.push(Box::new(imm.iter().collect::<Vec<_>>().into_iter()));
@@ -668,6 +682,8 @@ mod tests {
     use std::assert_eq;
 
     use super::*;
+    use crate::schema::{ColumnDef, SemanticType};
+    use arrow_schema::DataType;
     use tempfile::tempdir;
 
     fn k(tag: u8, ts: i64) -> Key {
@@ -859,6 +875,98 @@ mod tests {
         assert_eq!(mgr.get(k(9, 0))?, Some(v("v9")));
         assert_eq!(mgr.get(k(10, 0))?, Some(v("v10")));
         assert_eq!(mgr.get(k(11, 0))?, Some(v("v11")));
+
+        Ok(())
+    }
+
+    fn schema3() -> TableSchema {
+        TableSchema {
+            columns: vec![
+                ColumnDef {
+                    name: "host".into(),
+                    data_type: DataType::Utf8,
+                    semantic: SemanticType::Tag,
+                },
+                ColumnDef {
+                    name: "cpu".into(),
+                    data_type: DataType::Utf8,
+                    semantic: SemanticType::Tag,
+                },
+                ColumnDef {
+                    name: "timestamp".into(),
+                    data_type: DataType::Int64,
+                    semantic: SemanticType::Timestamp,
+                },
+                ColumnDef {
+                    name: "value".into(),
+                    data_type: DataType::Float64,
+                    semantic: SemanticType::Field,
+                },
+                ColumnDef {
+                    name: "note".into(),
+                    data_type: DataType::Utf8,
+                    semantic: SemanticType::Field,
+                },
+            ],
+            primary_key: vec![0, 1],
+            time_index: 2,
+        }
+    }
+
+    fn mkkey(s: &TableSchema, host: &str, cpu: &str, ts: i64) -> Key {
+        s.key(&[host.as_bytes().to_vec(), cpu.as_bytes().to_vec()], ts)
+    }
+    fn mkval(s: &TableSchema, value: f64, note: &str) -> Value {
+        s.value(&[value.to_le_bytes().to_vec(), note.as_bytes().to_vec()])
+    }
+
+    #[test]
+    fn test_manager_multi_tag_flush_compact() -> io::Result<()> {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal.log");
+        let schema = Arc::new(schema3());
+        let mut mgr = MemtableManager::with_schema(&wal_path, schema.clone())?;
+        mgr.set_flush_threshold(2);
+
+        let rows = vec![
+            (("h1", "c1", 10), 1.5, "a"),
+            (("h1", "c2", 10), 2.5, "b"),
+            (("h1", "c1", 20), 3.5, "c"),
+            (("h2", "c1", 10), 4.5, "d"),
+            (("h2", "c2", 10), 5.5, "e"),
+            (("h2", "c2", 20), 6.5, "f"),
+            (("h1", "c2", 30), 7.5, "g"),
+            (("h2", "c1", 30), 8.5, "h"),
+        ];
+        for ((host, cpu, ts), value, note) in rows.clone() {
+            mgr.write(mkkey(&schema, host, cpu, ts), mkval(&schema, value, note))?;
+        }
+        assert_eq!(mgr.get_immutable_ssts().len(), 4);
+
+        mgr.compact()?;
+        assert_eq!(mgr.get_immutable_ssts().len(), 1);
+
+        for ((host, cpu, ts), value, note) in rows.clone() {
+            let got = mgr.get(mkkey(&schema, host, cpu, ts))?;
+            assert_eq!(
+                got,
+                Some(mkval(&schema, value, note)),
+                "{} {} {}",
+                host,
+                cpu,
+                ts
+            );
+        }
+        assert_eq!(mgr.get(mkkey(&schema, "h1", "c1", 99))?, None);
+
+        mgr.delete(mkkey(&schema, "h1", "c1", 20))?;
+        mgr.flush()?;
+        mgr.compact()?;
+        assert_eq!(mgr.get(mkkey(&schema, "h1", "c1", 20))?, None);
+        assert_eq!(
+            mgr.get(mkkey(&schema, "h2", "c1", 10))?,
+            Some(mkval(&schema, 4.5, "d"))
+        );
 
         Ok(())
     }

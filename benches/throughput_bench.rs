@@ -2,9 +2,7 @@ use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use mini_mito::{
-    Key, MemtableManager, Value,
-    memtable::{SkipList, Wal, wal::Operation},
-    sstable::sstable::SSTable,
+    Key, MemtableManager, Value, memtable::{SkipList, Wal, wal::Operation}, schema::TableSchema, sstable::sstable::SSTable,
 };
 use tempfile::tempdir;
 
@@ -70,7 +68,7 @@ fn bench_create_sstable(c: &mut Criterion) {
                 let list = build_skiplist(size);
                 let dir = tempdir().unwrap();
                 let path = dir.path().join("temp.sst");
-                let sst = SSTable::create_from_skiplist(&list, 0, &path, true).unwrap();
+                let sst = SSTable::create_from_skiplist(&list, 0, &path, true, &TableSchema::default_table()).unwrap();
                 black_box(sst);
             });
         });
@@ -84,7 +82,7 @@ fn bench_sstable_scan(c: &mut Criterion) {
         let list = build_skiplist(*size);
         let dir = tempdir().unwrap();
         let path = dir.path().join("scan.sst");
-        let sstable = SSTable::create_from_skiplist(&list, 0, &path, true).unwrap();
+        let sstable = SSTable::create_from_skiplist(&list, 0, &path, true, &TableSchema::default_table()).unwrap();
         let min = sstable.min_key().clone();
         let max = sstable.max_key().clone();
 
@@ -117,7 +115,7 @@ fn bench_compaction(c: &mut Criterion) {
                 list.insert(key, Some(value));
             }
             let path = dir.path().join(format!("{}.sst", id));
-            let sst = SSTable::create_from_skiplist(&list, id as usize, &path, true).unwrap();
+            let sst = SSTable::create_from_skiplist(&list, id as usize, &path, true, &TableSchema::default_table()).unwrap();
             sstables.push(sst);
         }
 
@@ -135,7 +133,7 @@ fn bench_compaction(c: &mut Criterion) {
                     }
                     let new_path = dir.join("merged.sst");
                     let _new_sst =
-                        SSTable::create_from_skiplist(&merged, 999, &new_path, true).unwrap();
+                        SSTable::create_from_skiplist(&merged, 999, &new_path, true, &TableSchema::default_table()).unwrap();
                     black_box(merged);
                 });
             },

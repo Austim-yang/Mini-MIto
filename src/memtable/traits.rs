@@ -1,6 +1,6 @@
 use std::{io, path::Path};
 
-use crate::{Key, Value, sstable::sstable::SSTable};
+use crate::{Key, Value, schema::TableSchema, sstable::sstable::SSTable};
 
 pub trait Memtable: Send + Sync {
     fn write(&self, key: Key, value: Option<Value>) -> io::Result<Option<Value>>;
@@ -21,6 +21,6 @@ pub trait ImmutableMemtable: Send + Sync {
     fn iter(&self) -> Box<dyn Iterator<Item = (Key, Option<Value>)> + '_>;
     fn len(&self) -> usize;
     fn estimated_size(&self) -> usize;
-    fn to_sstable(&self, id: usize, path: &Path) -> io::Result<SSTable>;
+    fn to_sstable(&self, id: usize, path: &Path, schema: &TableSchema) -> io::Result<SSTable>;
     fn wal_path(&self) -> &Path;
 }

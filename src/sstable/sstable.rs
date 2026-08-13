@@ -6,8 +6,7 @@ use std::{
     vec,
 };
 
-use arrow::array::{Array, ArrayRef, BinaryArray, Int64Array, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
+use arrow::array::{ArrayRef, RecordBatch};
 use parquet::{
     arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
     file::properties::WriterProperties,
@@ -15,19 +14,42 @@ use parquet::{
 
 use crate::{
     memtable::SkipList,
+    schema::{SemanticType, TableSchema, cells_to_array, parse_column_cells},
     types::{Key, Value},
 };
 
-const TAG_COL: usize = 0;
-const TS_COL: usize = 1;
-const FIELDS_COL: usize = 2;
+fn key_at(cols: &[Vec<Option<Vec<u8>>>], schema: &TableSchema, i: usize) -> Key {
+    let row: Vec<Vec<u8>> = (0..schema.columns.len())
+        .map(|c| cols[c][i].clone().unwrap_or_default())
+        .collect();
+    schema.cells_to_key(&row)
+}
 
-fn sst_schema() -> Schema {
-    Schema::new(vec![
-        Field::new("tags", DataType::Binary, false),
-        Field::new("timestamp", DataType::Int64, false),
-        Field::new("fields", DataType::Binary, true),
-    ])
+fn value_at(cols: &[Vec<Option<Vec<u8>>>], schema: &TableSchema, i: usize) -> Option<Value> {
+    let tombstone = schema
+        .columns
+        .iter()
+        .enumerate()
+        .any(|(c, col)| col.semantic == SemanticType::Field && cols[c][i].is_none());
+    if tombstone {
+        return None;
+    }
+    let row: Vec<Vec<u8>> = (0..schema.columns.len())
+        .map(|c| cols[c][i].clone().unwrap_or_default())
+        .collect();
+    Some(schema.encode_fields(&row))
+}
+
+fn parse_batch(batch: &RecordBatch, schema: &TableSchema) -> Vec<Vec<Option<Vec<u8>>>> {
+    (0..schema.columns.len())
+        .map(|c| {
+            parse_column_cells(
+                &schema.columns[c].data_type,
+                batch.column(c),
+                batch.num_rows(),
+            )
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -37,16 +59,25 @@ pub struct SSTable {
     min_key: Key,
     max_key: Key,
     entry_count: usize,
+    schema: Arc<TableSchema>,
 }
 
 impl SSTable {
-    pub fn new(id: usize, path: PathBuf, min_key: Key, max_key: Key, entry_count: usize) -> Self {
+    pub fn new(
+        id: usize,
+        path: PathBuf,
+        min_key: Key,
+        max_key: Key,
+        entry_count: usize,
+        schema: Arc<TableSchema>,
+    ) -> Self {
         SSTable {
             id,
             path,
             min_key,
             max_key,
             entry_count,
+            schema,
         }
     }
 
@@ -55,10 +86,10 @@ impl SSTable {
         id: usize,
         path: impl AsRef<Path>,
         include_tombstones: bool,
+        schema: &TableSchema,
     ) -> io::Result<Self> {
-        let mut tag_buf = Vec::with_capacity(skiplist.len());
-        let mut ts_buf = Vec::with_capacity(skiplist.len());
-        let mut field_buf = Vec::with_capacity(skiplist.len());
+        let ncols = schema.columns.len();
+        let mut cols: Vec<Vec<Option<Vec<u8>>>> = vec![Vec::with_capacity(skiplist.len()); ncols];
         let mut min_key = None;
         let mut max_key = None;
         let mut count = 0;
@@ -67,34 +98,38 @@ impl SSTable {
             if !include_tombstones && value.is_none() {
                 continue;
             }
+            let cells = schema.key_to_cells(&key);
+            let decoded = value.as_ref().map(|blob| schema.decode_fields(blob));
+            let mut field_index = 0;
+            for (i, col) in schema.columns.iter().enumerate() {
+                if col.semantic == SemanticType::Field {
+                    cols[i].push(match (&value, &decoded) {
+                        (Some(_), Some(fcells)) => Some(fcells[field_index].clone()),
+                        _ => None,
+                    });
+                    field_index += 1;
+                } else {
+                    cols[i].push(Some(cells[i].clone()));
+                }
+            }
             if min_key.is_none() || key < *min_key.as_ref().unwrap() {
                 min_key = Some(key.clone());
             }
             if max_key.is_none() || key > *max_key.as_ref().unwrap() {
                 max_key = Some(key.clone());
             }
-            let (tags, ts) = key;
-            tag_buf.push(tags);
-            ts_buf.push(ts);
-            field_buf.push(value);
             count += 1;
         }
 
-        let batch = RecordBatch::try_new(
-            Arc::new(sst_schema()),
-            vec![
-                Arc::new(BinaryArray::from_iter_values(tag_buf)) as ArrayRef,
-                Arc::new(Int64Array::from_iter_values(ts_buf)) as ArrayRef,
-                Arc::new(BinaryArray::from_iter(
-                    field_buf.iter().map(|o| o.as_deref()),
-                )) as ArrayRef,
-            ],
-        )
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let arrays: Vec<ArrayRef> = (0..ncols)
+            .map(|i| cells_to_array(&schema.columns[i].data_type, &cols[i]))
+            .collect();
+        let batch = RecordBatch::try_new(Arc::new(schema.arrow_schema()), arrays)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         let file = File::create(path.as_ref())?;
         let props = WriterProperties::builder().build();
-        let mut writer = ArrowWriter::try_new(file, Arc::new(sst_schema()), Some(props))
+        let mut writer = ArrowWriter::try_new(file, Arc::new(schema.arrow_schema()), Some(props))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         writer
@@ -110,33 +145,23 @@ impl SSTable {
             min_key: min_key.unwrap_or_default(),
             max_key: max_key.unwrap_or_default(),
             entry_count: count,
+            schema: Arc::new(schema.clone()),
         })
     }
 
-    pub fn open_from_path(path: impl AsRef<Path>) -> io::Result<Self> {
+    pub fn open_from_path(path: impl AsRef<Path>, schema: &TableSchema) -> io::Result<Self> {
         let file = File::open(&path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let mut reader = builder.build()?;
+        let reader = builder.build()?;
         let mut min_key: Option<Key> = None;
         let mut max_key: Option<Key> = None;
         let mut count = 0;
-        while let Some(batch) = reader.next() {
-            let batch = batch
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-                .unwrap();
-            let tags = batch
-                .column(TAG_COL)
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .unwrap();
-            let ts = batch
-                .column(TS_COL)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
+        for batch in reader {
+            let batch = batch.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let cols = parse_batch(&batch, schema);
             for i in 0..batch.num_rows() {
-                let k = (tags.value(i).to_vec(), ts.value(i));
+                let k = key_at(&cols, schema, i);
                 if min_key.is_none() || k < *min_key.as_ref().unwrap() {
                     min_key = Some(k.clone());
                 }
@@ -160,6 +185,7 @@ impl SSTable {
             min_key.unwrap_or_default(),
             max_key.unwrap_or_default(),
             count,
+            Arc::new(schema.clone()),
         ))
     }
 
@@ -168,38 +194,22 @@ impl SSTable {
             return Ok(None);
         }
 
-        let file = File::open(&self.path).unwrap();
+        let file = File::open(&self.path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-            .unwrap();
-        let mut reader = builder.build()?;
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let reader = builder.build()?;
 
-        while let Some(batch_result) = reader.next() {
-            let batch = batch_result.unwrap();
-            let tags = batch
-                .column(TAG_COL)
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .expect("key column must be BinaryArray");
-            let ts = batch
-                .column(TS_COL)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("value column must be Int64Array");
-            let fields = batch
-                .column(FIELDS_COL)
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .expect("value column must be BinaryArray");
+        for batch_result in reader {
+            let batch = batch_result.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let cols = parse_batch(&batch, &self.schema);
 
             for i in 0..batch.num_rows() {
-                let k = (tags.value(i).to_vec(), ts.value(i));
+                let k = key_at(&cols, &self.schema, i);
                 if k > *key {
                     return Ok(None);
                 }
                 if k == *key {
-                    let v = (!fields.is_null(i)).then(|| fields.value(i).to_vec());
-                    return Ok(Some(v));
+                    return Ok(Some(value_at(&cols, &self.schema, i)));
                 }
             }
         }
@@ -212,39 +222,23 @@ impl SSTable {
             return Ok(Vec::new());
         }
 
-        let file = File::open(&self.path).unwrap();
+        let file = File::open(&self.path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-            .unwrap();
-        let mut reader = builder.build()?;
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let reader = builder.build()?;
 
         let mut results = Vec::new();
-        while let Some(batch_result) = reader.next() {
-            let batch = batch_result.unwrap();
-            let tags = batch
-                .column(TAG_COL)
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .expect("key column must be BinaryArray");
-            let ts = batch
-                .column(TS_COL)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("value column must be Int64Array");
-            let fields = batch
-                .column(FIELDS_COL)
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .expect("value column must be BinaryArray");
+        for batch_result in reader {
+            let batch = batch_result.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let cols = parse_batch(&batch, &self.schema);
 
             for i in 0..batch.num_rows() {
-                let k = (tags.value(i).to_vec(), ts.value(i));
+                let k = key_at(&cols, &self.schema, i);
                 if k > *end {
                     return Ok(results);
                 }
                 if k >= *start {
-                    let v = (!fields.is_null(i)).then(|| fields.value(i).to_vec());
-                    results.push((k, v));
+                    results.push((k, value_at(&cols, &self.schema, i)));
                 }
             }
         }
@@ -254,13 +248,11 @@ impl SSTable {
 
     pub fn scan_iter(&self, start: &Key, end: &Key) -> io::Result<SSTableIter> {
         if self.entry_count == 0 || start > end || end < &self.min_key || start > &self.max_key {
-            return Ok(SSTableIter {
-                inner: Box::new(std::iter::empty()),
-                current: Vec::new(),
-                pos: 0,
-                start: start.clone(),
-                end: end.clone(),
-            });
+            return Ok(SSTableIter::empty(
+                start.clone(),
+                end.clone(),
+                self.schema.clone(),
+            ));
         }
         let file = File::open(&self.path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -274,6 +266,7 @@ impl SSTable {
             pos: 0,
             start: start.clone(),
             end: end.clone(),
+            schema: self.schema.clone(),
         })
     }
 
@@ -304,40 +297,37 @@ pub struct SSTableIter {
     pos: usize,
     start: Key,
     end: Key,
+    schema: Arc<TableSchema>,
 }
 
 impl SSTableIter {
+    fn empty(start: Key, end: Key, schema: Arc<TableSchema>) -> Self {
+        Self {
+            inner: Box::new(std::iter::empty()),
+            current: Vec::new(),
+            pos: 0,
+            start,
+            end,
+            schema,
+        }
+    }
+
     fn fill(&mut self) -> io::Result<bool> {
         while self.pos >= self.current.len() {
             match self.inner.next() {
                 None => return Ok(false),
                 Some(batch) => {
                     let batch = batch?;
-                    let tags = batch
-                        .column(TAG_COL)
-                        .as_any()
-                        .downcast_ref::<BinaryArray>()
-                        .unwrap();
-                    let ts = batch
-                        .column(TS_COL)
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .unwrap();
-                    let fields = batch
-                        .column(FIELDS_COL)
-                        .as_any()
-                        .downcast_ref::<BinaryArray>()
-                        .unwrap();
+                    let cols = parse_batch(&batch, &self.schema);
                     self.current.clear();
                     self.pos = 0;
                     for i in 0..batch.num_rows() {
-                        let k = (tags.value(i).to_vec(), ts.value(i));
+                        let k = key_at(&cols, &self.schema, i);
                         if k > self.end {
                             break;
                         }
                         if k >= self.start {
-                            let v = (!fields.is_null(i)).then(|| fields.value(i).to_vec());
-                            self.current.push((k, v));
+                            self.current.push((k, value_at(&cols, &self.schema, i)));
                         }
                     }
                 }
@@ -350,11 +340,10 @@ impl SSTableIter {
 impl Iterator for SSTableIter {
     type Item = (Key, Option<Value>);
     fn next(&mut self) -> Option<Self::Item> {
-        if self.pos >= self.current.len() {
-            if self.fill().ok()? == false {
-                return None;
-            }
+        if self.pos >= self.current.len() && !(self.fill().ok()?) {
+            return None;
         }
+
         let item = self.current[self.pos].clone();
         self.pos += 1;
         Some(item)
@@ -364,8 +353,9 @@ impl Iterator for SSTableIter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memtable::SkipList;
+    use crate::{memtable::SkipList, schema::ColumnDef};
     use tempfile::tempdir;
+    use arrow_schema::DataType;
 
     fn k(tag: u8, ts: i64) -> Key {
         (vec![tag], ts)
@@ -384,7 +374,13 @@ mod tests {
         skiplist.insert(k(20, 0), Some(v("twenty")));
         skiplist.insert(k(30, 0), Some(v("thirty")));
 
-        let sstable = SSTable::create_from_skiplist(&skiplist, 1, &path, true)?;
+        let sstable = SSTable::create_from_skiplist(
+            &skiplist,
+            1,
+            &path,
+            true,
+            &TableSchema::default_table(),
+        )?;
 
         assert_eq!(sstable.entry_count(), 3);
         assert_eq!(sstable.min_key(), &k(10, 0));
@@ -416,7 +412,13 @@ mod tests {
         skiplist.insert(k(40, 0), Some(v("forty")));
         skiplist.insert(k(50, 0), Some(v("fifty")));
 
-        let sstable = SSTable::create_from_skiplist(&skiplist, 1, &path, true)?;
+        let sstable = SSTable::create_from_skiplist(
+            &skiplist,
+            1,
+            &path,
+            true,
+            &TableSchema::default_table(),
+        )?;
 
         let result = sstable.scan(&k(20, 0), &k(40, 0))?;
         assert_eq!(result.len(), 3);
@@ -449,7 +451,7 @@ mod tests {
         list.insert((vec![1], 200), None);
         list.insert((vec![2], 100), Some(v("b")));
 
-        SSTable::create_from_skiplist(&list, 1, &path, true)?;
+        SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())?;
 
         let file = File::open(&path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
@@ -469,13 +471,14 @@ mod tests {
         let list = SkipList::new();
         list.insert((vec![1], 10), Some(v("a")));
         list.insert((vec![1], 20), None);
-        let sst = SSTable::create_from_skiplist(&list, 1, &path, true)?;
+        let sst =
+            SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())?;
 
         assert_eq!(sst.get(&(vec![1], 20))?.unwrap(), None);
         assert_eq!(sst.get(&(vec![1], 10))?.unwrap(), Some(v("a")));
         assert_eq!(sst.get(&(vec![9], 99))?, None);
 
-        let reopened = SSTable::open_from_path(&path)?;
+        let reopened = SSTable::open_from_path(&path, &TableSchema::default_table())?;
         assert_eq!(reopened.min_key(), &(vec![1], 10));
         assert_eq!(reopened.max_key(), &(vec![1], 20));
         assert_eq!(reopened.entry_count(), 2);
@@ -490,11 +493,82 @@ mod tests {
         for i in 0..10 {
             list.insert((vec![i], i as i64), Some(v(&format!("v{}", i))));
         }
-        let sst = SSTable::create_from_skiplist(&list, 1, &path, true)?;
+        let sst =
+            SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())?;
         let got: Vec<_> = sst.scan_iter(&(vec![3], 3), &(vec![6], 6))?.collect();
         assert_eq!(got.len(), 4);
         assert_eq!(got[0].0, (vec![3], 3));
         assert_eq!(got[3].0, (vec![6], 6));
+        Ok(())
+    }
+
+    fn schema3() -> TableSchema {
+        TableSchema {
+            columns: vec![
+                ColumnDef {
+                    name: "host".into(),
+                    data_type: DataType::Binary,
+                    semantic: SemanticType::Tag,
+                },
+                ColumnDef {
+                    name: "region".into(),
+                    data_type: DataType::Binary,
+                    semantic: SemanticType::Tag,
+                },
+                ColumnDef {
+                    name: "ts".into(),
+                    data_type: DataType::Int64,
+                    semantic: SemanticType::Timestamp,
+                },
+                ColumnDef {
+                    name: "cpu".into(),
+                    data_type: DataType::Int64,
+                    semantic: SemanticType::Field,
+                },
+                ColumnDef {
+                    name: "mem".into(),
+                    data_type: DataType::Int64,
+                    semantic: SemanticType::Field,
+                },
+            ],
+            primary_key: vec![0, 1],
+            time_index: 2,
+        }
+    }
+
+    fn cells(host: &[u8], region: &[u8], ts: i64, cpu: i64, mem: i64) -> Vec<Vec<u8>> {
+        vec![
+            host.to_vec(),
+            region.to_vec(),
+            ts.to_le_bytes().to_vec(),
+            cpu.to_le_bytes().to_vec(),
+            mem.to_le_bytes().to_vec(),
+        ]
+    }
+
+    #[test]
+    fn test_sstable_multi_tag_roundtrip() -> io::Result<()> {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("1.sst");
+        let schema = schema3();
+        let list = SkipList::new();
+        let rows = vec![
+            cells(b"h1", b"cn", 100, 1, 2),
+            cells(b"h1", b"cn", 200, 3, 4),
+            cells(b"h2", b"us", 100, 5, 6),
+        ];
+        for c in &rows {
+            list.insert(schema.cells_to_key(c), Some(schema.encode_fields(c)));
+        }
+        let sst = SSTable::create_from_skiplist(&list, 1, &path, true, &schema)?;
+        let k = schema.cells_to_key(&rows[1]);
+        assert_eq!(sst.get(&k)?.unwrap(), Some(schema.encode_fields(&rows[1])));
+
+        let reopened = SSTable::open_from_path(&path, &schema)?;
+        assert_eq!(reopened.entry_count(), 3);
+        assert_eq!(reopened.min_key(), sst.min_key());
+        let got = sst.scan(sst.min_key(), sst.max_key())?;
+        assert_eq!(got.len(), 3);
         Ok(())
     }
 }

@@ -1,7 +1,7 @@
 use std::{pin::Pin, sync::Arc, vec};
 
 use datafusion::{
-    arrow::datatypes::{DataType, Field, Schema, SchemaRef},
+    arrow::datatypes::SchemaRef,
     catalog::{Session, TableProvider},
     datasource::TableType,
     logical_expr::{Expr, TableProviderFilterPushDown},
@@ -12,18 +12,6 @@ use datafusion::error::Result as DataFusionResult;
 
 use crate::{memtable::memtable::MemtableManager, query::scan::LSMScanExec};
 
-pub const TAGS_COL: usize = 0;
-pub const TIMESTAMP_COL: usize = 1;
-pub const FIELDS_COL: usize = 2;
-
-pub(crate) fn lsm_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
-        Field::new("tags", DataType::Binary, false),
-        Field::new("timestamp", DataType::Int64, false),
-        Field::new("fields", DataType::Binary, false),
-    ]))
-}
-
 #[derive(Debug)]
 pub struct LSMTableProvider {
     memtable_manager: Arc<MemtableManager>,
@@ -32,9 +20,10 @@ pub struct LSMTableProvider {
 
 impl LSMTableProvider {
     pub fn new(memtable_manager: MemtableManager) -> Self {
+        let schema = Arc::new(memtable_manager.schema().arrow_schema());
         Self {
             memtable_manager: Arc::new(memtable_manager),
-            schema: lsm_schema(),
+            schema,
         }
     }
 }

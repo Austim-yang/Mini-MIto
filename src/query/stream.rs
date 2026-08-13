@@ -3,11 +3,12 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    vec,
 };
 
 use datafusion::{
     arrow::{
-        array::{ArrayRef, BinaryArray, Int64Array, RecordBatch},
+        array::{ArrayRef, RecordBatch},
         datatypes::SchemaRef,
     },
     error::DataFusionError,
@@ -20,6 +21,7 @@ use futures::Stream;
 use crate::{
     memtable::memtable::MemtableManager,
     query::merge::MergeIter,
+    schema::{SemanticType, TableSchema, cells_to_array},
     types::{Key, Value},
 };
 
@@ -29,6 +31,7 @@ pub struct LSMStream {
     schema: SchemaRef,
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
+    table_schema: Arc<TableSchema>,
     merge: MergeIter,
     batches: Vec<RecordBatch>,
     index: usize,
@@ -73,10 +76,12 @@ impl LSMStream {
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
     ) -> io::Result<Self> {
+        let table_schema = memtable_manager.schema();
         Ok(Self {
             schema,
             projection,
             limit,
+            table_schema,
             merge: MergeIter::new(memtable_manager.snapshot_sources()?),
             batches: Vec::new(),
             index: 0,
@@ -86,36 +91,44 @@ impl LSMStream {
 
     fn build_record_batch(
         chunk: &[(Key, Value)],
-        schema: &SchemaRef,
+        table_schema: &TableSchema,
+        projection: Option<&[usize]>,
     ) -> DataFusionResult<RecordBatch> {
-        let mut tags_vals = Vec::with_capacity(chunk.len());
-        let mut ts_vals = Vec::with_capacity(chunk.len());
-        let mut fields_vals = Vec::with_capacity(chunk.len());
+        let ncols = table_schema.columns.len();
+        let mut cols: Vec<Vec<Option<Vec<u8>>>> = vec![Vec::with_capacity(chunk.len()); ncols];
 
         for (key, value) in chunk {
-            let (tags, ts) = key;
-            tags_vals.push(tags.as_slice());
-            ts_vals.push(*ts);
-            fields_vals.push(value.as_slice());
+            let tags = table_schema.decode_tags(&key.0);
+            let ts = key.1.to_le_bytes().to_vec();
+            let fields = table_schema.decode_fields(value);
+            let mut tag_i = 0;
+            let mut field_i = 0;
+            for (c, col) in table_schema.columns.iter().enumerate() {
+                let cell = match col.semantic {
+                    SemanticType::Tag => Some(tags[tag_i].clone()),
+                    SemanticType::Timestamp => Some(ts.clone()),
+                    SemanticType::Field => Some(fields[field_i].clone()),
+                };
+                cols[c].push(cell);
+                match col.semantic {
+                    SemanticType::Tag => tag_i += 1,
+                    SemanticType::Field => field_i += 1,
+                    SemanticType::Timestamp => {}
+                }
+            }
         }
 
-        let tags_arr = Arc::new(BinaryArray::from_iter_values(tags_vals)) as ArrayRef;
-        let ts_arr = Arc::new(Int64Array::from_iter_values(ts_vals)) as ArrayRef;
-        let fields_arr = Arc::new(BinaryArray::from_iter_values(fields_vals)) as ArrayRef;
-
-        let arrays: Vec<ArrayRef> = schema
-            .fields()
-            .iter()
-            .map(|field| match field.name().as_str() {
-                "tags" => tags_arr.clone(),
-                "timestamp" => ts_arr.clone(),
-                "fields" => fields_arr.clone(),
-                _ => unreachable!(),
-            })
+        let arrays: Vec<ArrayRef> = (0..ncols)
+            .map(|c| cells_to_array(&table_schema.columns[c].data_type, &cols[c]))
             .collect();
-
-        RecordBatch::try_new(schema.clone(), arrays)
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+        let full = RecordBatch::try_new(Arc::new(table_schema.arrow_schema()), arrays)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        match projection {
+            Some(indices) => full
+                .project(indices)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None)),
+            None => Ok(full),
+        }
     }
 
     fn refill(&mut self) -> DataFusionResult<bool> {
@@ -128,10 +141,10 @@ impl LSMStream {
                 Some((k, Some(v))) => {
                     rows.push((k, v));
                     self.emitted += 1;
-                    if let Some(lim) = self.limit {
-                        if self.emitted >= lim {
-                            break;
-                        }
+                    if let Some(lim) = self.limit
+                        && self.emitted >= lim
+                    {
+                        break;
                     }
                 }
                 Some((_, None)) => {}
@@ -141,7 +154,8 @@ impl LSMStream {
         if rows.is_empty() {
             return Ok(false);
         }
-        let batch = Self::build_record_batch(&rows, &self.schema)?;
+        let batch =
+            Self::build_record_batch(&rows, &self.table_schema, self.projection.as_deref())?;
         self.batches.push(batch);
         Ok(true)
     }
@@ -151,7 +165,6 @@ impl LSMStream {
 mod tests {
     use super::*;
     use crate::memtable::MemtableManager;
-    use crate::query::provider::lsm_schema;
     use futures::StreamExt;
     use tempfile::tempdir;
 
@@ -173,8 +186,10 @@ mod tests {
         mgr.write(key(1, 10), val("a2")).unwrap();
         mgr.write(key(3, 10), val("c")).unwrap();
 
+        let mgr = Arc::new(mgr);
+        let schema = Arc::new(mgr.schema().arrow_schema());
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let stream = LSMStream::new(std::sync::Arc::new(mgr), lsm_schema(), None, None).unwrap();
+        let stream = LSMStream::new(mgr, schema, None, None).unwrap();
         let batches: Vec<_> = rt.block_on(async { stream.collect::<Vec<_>>().await });
         let mut rows = Vec::new();
         for b in batches {

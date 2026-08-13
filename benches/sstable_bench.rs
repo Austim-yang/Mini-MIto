@@ -1,7 +1,7 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use mini_mito::{memtable::SkipList, sstable::sstable::SSTable};
+use mini_mito::{memtable::SkipList, schema::TableSchema, sstable::sstable::SSTable};
 use rand::{RngExt, rng};
 use tempfile::tempdir;
 
@@ -26,7 +26,7 @@ fn bench_sstable_create(c: &mut Criterion) {
                 },
                 |(list, dir)| {
                     let path = dir.path().join("test.sst");
-                    let _ = SSTable::create_from_skiplist(&list, 1, &path, true).unwrap();
+                    let _ = SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table()).unwrap();
                 },
                 criterion::BatchSize::SmallInput,
             );
@@ -43,7 +43,7 @@ fn bench_sstable_get(c: &mut Criterion) {
     }
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.sst");
-    let sst = SSTable::create_from_skiplist(&list, 1, &path, true).unwrap();
+    let sst = SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table()).unwrap();
     let mut rng = rng();
 
     c.bench_function("sstable_get_hit", |b| {
@@ -68,7 +68,7 @@ fn bench_sstable_scan(c: &mut Criterion) {
     }
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.sst");
-    let sst = SSTable::create_from_skiplist(&list, 1, &path, true).unwrap();
+    let sst = SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table()).unwrap();
 
     c.bench_function("sstable_scan_all", |b| {
         b.iter(|| {
