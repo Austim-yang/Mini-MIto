@@ -16,7 +16,7 @@ pub const TAGS_COL: usize = 0;
 pub const TIMESTAMP_COL: usize = 1;
 pub const FIELDS_COL: usize = 2;
 
-fn lsm_schema() -> SchemaRef {
+pub(crate) fn lsm_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("tags", DataType::Binary, false),
         Field::new("timestamp", DataType::Int64, false),

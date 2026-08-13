@@ -252,6 +252,31 @@ impl SSTable {
         Ok(results)
     }
 
+    pub fn scan_iter(&self, start: &Key, end: &Key) -> io::Result<SSTableIter> {
+        if self.entry_count == 0 || start > end || end < &self.min_key || start > &self.max_key {
+            return Ok(SSTableIter {
+                inner: Box::new(std::iter::empty()),
+                current: Vec::new(),
+                pos: 0,
+                start: start.clone(),
+                end: end.clone(),
+            });
+        }
+        let file = File::open(&self.path)?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let reader = builder.build()?;
+        Ok(SSTableIter {
+            inner: Box::new(
+                reader.map(|r| r.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))),
+            ),
+            current: Vec::new(),
+            pos: 0,
+            start: start.clone(),
+            end: end.clone(),
+        })
+    }
+
     pub fn id(&self) -> usize {
         self.id
     }
@@ -270,6 +295,69 @@ impl SSTable {
 
     pub fn max_key(&self) -> &Key {
         &self.max_key
+    }
+}
+
+pub struct SSTableIter {
+    inner: Box<dyn Iterator<Item = io::Result<RecordBatch>> + Send>,
+    current: Vec<(Key, Option<Value>)>,
+    pos: usize,
+    start: Key,
+    end: Key,
+}
+
+impl SSTableIter {
+    fn fill(&mut self) -> io::Result<bool> {
+        while self.pos >= self.current.len() {
+            match self.inner.next() {
+                None => return Ok(false),
+                Some(batch) => {
+                    let batch = batch?;
+                    let tags = batch
+                        .column(TAG_COL)
+                        .as_any()
+                        .downcast_ref::<BinaryArray>()
+                        .unwrap();
+                    let ts = batch
+                        .column(TS_COL)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap();
+                    let fields = batch
+                        .column(FIELDS_COL)
+                        .as_any()
+                        .downcast_ref::<BinaryArray>()
+                        .unwrap();
+                    self.current.clear();
+                    self.pos = 0;
+                    for i in 0..batch.num_rows() {
+                        let k = (tags.value(i).to_vec(), ts.value(i));
+                        if k > self.end {
+                            break;
+                        }
+                        if k >= self.start {
+                            let v = (!fields.is_null(i)).then(|| fields.value(i).to_vec());
+                            self.current.push((k, v));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+}
+
+impl Iterator for SSTableIter {
+    type Item = (Key, Option<Value>);
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos >= self.current.len() {
+            if self.fill().ok()? == false {
+                return None;
+            }
+        }
+        let item = self.current[self.pos].clone();
+        self.pos += 1;
+        Some(item)
     }
 }
 
@@ -391,6 +479,22 @@ mod tests {
         assert_eq!(reopened.min_key(), &(vec![1], 10));
         assert_eq!(reopened.max_key(), &(vec![1], 20));
         assert_eq!(reopened.entry_count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_sstable_scan_iter() -> io::Result<()> {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("si.sst");
+        let list = SkipList::new();
+        for i in 0..10 {
+            list.insert((vec![i], i as i64), Some(v(&format!("v{}", i))));
+        }
+        let sst = SSTable::create_from_skiplist(&list, 1, &path, true)?;
+        let got: Vec<_> = sst.scan_iter(&(vec![3], 3), &(vec![6], 6))?.collect();
+        assert_eq!(got.len(), 4);
+        assert_eq!(got[0].0, (vec![3], 3));
+        assert_eq!(got[3].0, (vec![6], 6));
         Ok(())
     }
 }

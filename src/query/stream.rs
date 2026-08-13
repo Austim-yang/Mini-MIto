@@ -19,16 +19,20 @@ use futures::Stream;
 
 use crate::{
     memtable::memtable::MemtableManager,
+    query::merge::MergeIter,
     types::{Key, Value},
 };
 
+const BATCH_SIZE: usize = 10_000;
+
 pub struct LSMStream {
-    memtable_manager: Arc<MemtableManager>,
     schema: SchemaRef,
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
+    merge: MergeIter,
     batches: Vec<RecordBatch>,
     index: usize,
+    emitted: usize,
 }
 
 impl Unpin for LSMStream {}
@@ -48,9 +52,16 @@ impl Stream for LSMStream {
         if this.index < this.batches.len() {
             let batch = this.batches[this.index].clone();
             this.index += 1;
-            Poll::Ready(Some(Ok(batch)))
-        } else {
-            Poll::Ready(None)
+            return Poll::Ready(Some(Ok(batch)));
+        }
+        match this.refill() {
+            Ok(true) => {
+                let batch = this.batches[this.index].clone();
+                this.index += 1;
+                Poll::Ready(Some(Ok(batch)))
+            }
+            Ok(false) => Poll::Ready(None),
+            Err(e) => Poll::Ready(Some(Err(e))),
         }
     }
 }
@@ -62,37 +73,14 @@ impl LSMStream {
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
     ) -> io::Result<Self> {
-        let merged = memtable_manager.iter_all_data()?.collect::<Vec<_>>();
-
-        let mut rows = Vec::new();
-        for (key, value) in merged {
-            if let Some(v) = value {
-                rows.push((key, v));
-                if let Some(lim) = limit {
-                    if rows.len() >= lim {
-                        break;
-                    }
-                }
-            }
-        }
-
-        let batch_size = 10000;
-        let mut batches = Vec::new();
-
-        for chunk in rows.chunks(batch_size) {
-            let batch = Self::build_record_batch(chunk, &schema);
-            if let Ok(b) = batch {
-                batches.push(b);
-            }
-        }
-
         Ok(Self {
-            memtable_manager,
             schema,
             projection,
             limit,
-            batches,
+            merge: MergeIter::new(memtable_manager.snapshot_sources()?),
+            batches: Vec::new(),
             index: 0,
+            emitted: 0,
         })
     }
 
@@ -128,5 +116,85 @@ impl LSMStream {
 
         RecordBatch::try_new(schema.clone(), arrays)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    }
+
+    fn refill(&mut self) -> DataFusionResult<bool> {
+        if self.batches.len() > self.index {
+            return Ok(true);
+        }
+        let mut rows: Vec<(Key, Value)> = Vec::new();
+        while rows.len() < BATCH_SIZE {
+            match self.merge.next() {
+                Some((k, Some(v))) => {
+                    rows.push((k, v));
+                    self.emitted += 1;
+                    if let Some(lim) = self.limit {
+                        if self.emitted >= lim {
+                            break;
+                        }
+                    }
+                }
+                Some((_, None)) => {}
+                None => break,
+            }
+        }
+        if rows.is_empty() {
+            return Ok(false);
+        }
+        let batch = Self::build_record_batch(&rows, &self.schema)?;
+        self.batches.push(batch);
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memtable::MemtableManager;
+    use crate::query::provider::lsm_schema;
+    use futures::StreamExt;
+    use tempfile::tempdir;
+
+    fn key(tag: u8, ts: i64) -> (Vec<u8>, i64) {
+        (vec![tag], ts)
+    }
+    fn val(s: &str) -> Vec<u8> {
+        s.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn test_lsm_stream_merges_layers() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let mut mgr = MemtableManager::new(&path).unwrap();
+        mgr.set_flush_threshold(2);
+        mgr.write(key(1, 10), val("a")).unwrap();
+        mgr.write(key(2, 10), val("b")).unwrap();
+        mgr.write(key(1, 10), val("a2")).unwrap();
+        mgr.write(key(3, 10), val("c")).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let stream = LSMStream::new(std::sync::Arc::new(mgr), lsm_schema(), None, None).unwrap();
+        let batches: Vec<_> = rt.block_on(async { stream.collect::<Vec<_>>().await });
+        let mut rows = Vec::new();
+        for b in batches {
+            let b = b.unwrap();
+            for i in 0..b.num_rows() {
+                rows.push((
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::BinaryArray>()
+                        .unwrap()
+                        .value(i)
+                        .to_vec(),
+                    b.column(1)
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .unwrap()
+                        .value(i),
+                ));
+            }
+        }
+        assert_eq!(rows, vec![(vec![1], 10), (vec![2], 10), (vec![3], 10)]);
     }
 }

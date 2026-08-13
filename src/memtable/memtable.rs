@@ -618,6 +618,27 @@ impl MemtableManager {
         Ok(map.into_iter())
     }
 
+    pub fn snapshot_sources(
+        &self,
+    ) -> io::Result<Vec<Box<dyn Iterator<Item = (Key, Option<Value>)>>>> {
+        let mut out: Vec<Box<dyn Iterator<Item = (Key, Option<Value>)>>> = Vec::new();
+        if let Some(active) = self.active.read().unwrap().as_ref() {
+            if active.len() > 0 {
+                out.push(Box::new(active.iter().collect::<Vec<_>>().into_iter()));
+            }
+        }
+        for imm in self.immutables.read().unwrap().iter().rev() {
+            if imm.len() > 0 {
+                out.push(Box::new(imm.iter().collect::<Vec<_>>().into_iter()));
+            }
+        }
+        for sst in self.immutable_ssts.read().unwrap().iter().rev() {
+            let iter = sst.scan_iter(sst.min_key(), sst.max_key())?;
+            out.push(Box::new(iter));
+        }
+        Ok(out)
+    }
+
     pub fn close(&self) -> io::Result<()> {
         if let Some(active) = self.active.read().unwrap().as_ref() {
             active.close()?;
