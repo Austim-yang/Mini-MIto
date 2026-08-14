@@ -68,7 +68,7 @@ impl TableSchema {
         )
     }
 
-    fn push_len_perfixed(out: &mut Vec<u8>, bytes: &[u8]) {
+    fn push_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
         out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         out.extend_from_slice(bytes);
     }
@@ -87,7 +87,7 @@ impl TableSchema {
         } else {
             let mut out = Vec::new();
             for &idx in &self.primary_key {
-                Self::push_len_perfixed(&mut out, &cells[idx]);
+                Self::push_len_prefixed(&mut out, &cells[idx]);
             }
             out
         }
@@ -123,7 +123,7 @@ impl TableSchema {
         let mut out = Vec::new();
         for (i, c) in self.columns.iter().enumerate() {
             if c.semantic == SemanticType::Field {
-                Self::push_len_perfixed(&mut out, &cells[i]);
+                Self::push_len_prefixed(&mut out, &cells[i]);
             }
         }
         out

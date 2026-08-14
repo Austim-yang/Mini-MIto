@@ -7,7 +7,6 @@ use crate::{Key, Value};
 
 struct HeapEntry {
     key: Key,
-    priority: usize,
     src: usize,
     value: Option<Value>,
 }
@@ -30,7 +29,6 @@ impl Ord for HeapEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         self.key
             .cmp(&other.key)
-            .then_with(|| self.priority.cmp(&other.priority))
             .then_with(|| self.src.cmp(&other.src))
     }
 }
@@ -56,7 +54,6 @@ impl MergeIter {
         if let Some((key, value)) = self.sources[src].next() {
             self.heap.push(Reverse(HeapEntry {
                 key,
-                priority: src,
                 src,
                 value,
             }));
