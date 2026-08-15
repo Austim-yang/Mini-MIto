@@ -15,10 +15,7 @@ use crate::{
         SkipList, Wal,
         traits::{ImmutableMemtable, Memtable},
         wal::Operation,
-    },
-    schema::TableSchema,
-    sstable::sstable::SSTable,
-    types::{Key, Value},
+    }, schema::TableSchema, sstable::sstable::{SSTable, SstableIndex}, types::{Key, Value},
 };
 
 #[derive(Serialize, Deserialize)]
@@ -347,6 +344,7 @@ impl MemtableManager {
         for entry in entries {
             let path = self.base_dir.join(&entry.path);
             if path.exists() {
+                let index = SstableIndex::load_from_file(&path)?;
                 let sst = SSTable::new(
                     entry.id,
                     path,
@@ -354,6 +352,7 @@ impl MemtableManager {
                     entry.max_key,
                     entry.entry_count,
                     self.schema.clone(),
+                    index,
                 );
                 ssts.push(sst);
                 let current = self.sst_id.load(Ordering::SeqCst);

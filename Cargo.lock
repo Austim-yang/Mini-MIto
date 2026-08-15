@@ -2126,6 +2126,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "arrow-schema",
+ "base64",
  "criterion",
  "crossbeam-skiplist",
  "datafusion",

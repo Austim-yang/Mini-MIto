@@ -26,7 +26,14 @@ fn bench_sstable_create(c: &mut Criterion) {
                 },
                 |(list, dir)| {
                     let path = dir.path().join("test.sst");
-                    let _ = SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table()).unwrap();
+                    let _ = SSTable::create_from_skiplist(
+                        &list,
+                        1,
+                        &path,
+                        true,
+                        &TableSchema::default_table(),
+                    )
+                    .unwrap();
                 },
                 criterion::BatchSize::SmallInput,
             );
@@ -43,7 +50,8 @@ fn bench_sstable_get(c: &mut Criterion) {
     }
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.sst");
-    let sst = SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table()).unwrap();
+    let sst = SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())
+        .unwrap();
     let mut rng = rng();
 
     c.bench_function("sstable_get_hit", |b| {
@@ -68,7 +76,8 @@ fn bench_sstable_scan(c: &mut Criterion) {
     }
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.sst");
-    let sst = SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table()).unwrap();
+    let sst = SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())
+        .unwrap();
 
     c.bench_function("sstable_scan_all", |b| {
         b.iter(|| {
@@ -85,5 +94,63 @@ fn bench_sstable_scan(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_sstable_create, bench_sstable_get, bench_sstable_scan);
+fn bench_sstable_get_100k(c: &mut Criterion) {
+    let size: u64 = 100_000;
+    let list = SkipList::new();
+    for i in 0..size {
+        list.insert(key(i), Some(value(i)));
+    }
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test.sst");
+    let sst = SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())
+        .unwrap();
+    let mut rng = rng();
+
+    c.bench_function("sstable_get_hit_100k", |b| {
+        b.iter(|| {
+            let idx = black_box(rng.random_range(0..size));
+            let _ = sst.get(&key(idx)).unwrap();
+        });
+    });
+    c.bench_function("sstable_get_miss_100k", |b| {
+        b.iter(|| {
+            let idx = black_box(rng.random_range(size..(size * 2)));
+            let _ = sst.get(&key(idx)).unwrap();
+        });
+    });
+}
+
+fn bench_sstable_scan_100k(c: &mut Criterion) {
+    let size: u64 = 100_000;
+    let list = SkipList::new();
+    for i in 0..size {
+        list.insert(key(i), Some(value(i)));
+    }
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test.sst");
+    let sst = SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())
+        .unwrap();
+
+    c.bench_function("sstable_scan_all_100k", |b| {
+        b.iter(|| {
+            let _ = sst.scan(&key(0), &key(size - 1)).unwrap();
+        });
+    });
+    c.bench_function("sstable_scan_range_10pct_100k", |b| {
+        b.iter(|| {
+            let start = black_box(size / 10);
+            let end = black_box(size / 10 * 2);
+            let _ = sst.scan(&key(start), &key(end)).unwrap();
+        });
+    });
+}
+
+criterion_group!(
+    benches,
+    bench_sstable_create,
+    bench_sstable_get,
+    bench_sstable_get_100k,
+    bench_sstable_scan,
+    bench_sstable_scan_100k,
+);
 criterion_main!(benches);

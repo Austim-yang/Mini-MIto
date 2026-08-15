@@ -1,5 +1,7 @@
 use std::{
-    fs::File,
+    collections::HashMap,
+    fmt::Write,
+    fs::{self, File},
     io,
     path::{Path, PathBuf},
     sync::Arc,
@@ -7,16 +9,196 @@ use std::{
 };
 
 use arrow::array::{ArrayRef, RecordBatch};
+use base64::Engine;
 use parquet::{
     arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
     file::properties::WriterProperties,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
     memtable::SkipList,
     schema::{BatchView, SemanticType, TableSchema, cells_to_array},
+    sstable::bloom::BloomFilter,
     types::{Key, Value},
 };
+
+const CHUNK_ROWS: usize = 8192;
+const INDEX_META_KEY: &str = "sstable.index";
+const INDEX_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RowGroupMeta {
+    pub(crate) num_rows: usize,
+    pub(crate) min_key: Key,
+    pub(crate) max_key: Key,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SstableIndex {
+    pub(crate) bloom: BloomFilter,
+    pub(crate) row_groups: Vec<RowGroupMeta>,
+}
+
+impl SstableIndex {
+    pub(crate) fn to_json(&self) -> io::Result<String> {
+        let dto = IndexDto {
+            version: INDEX_VERSION,
+            bloom: BloomDto {
+                m: self.bloom.m,
+                k: self.bloom.k,
+                seed: self.bloom.seed,
+                bits: base64::engine::general_purpose::STANDARD.encode(&self.bloom.bits),
+            },
+            row_groups: self
+                .row_groups
+                .iter()
+                .map(|rg| RowGroupDto {
+                    num_rows: rg.num_rows,
+                    min_key: hex_key(&rg.min_key),
+                    max_key: hex_key(&rg.max_key),
+                })
+                .collect(),
+        };
+        serde_json::to_string(&dto).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    pub(crate) fn from_json(s: &str) -> io::Result<Arc<SstableIndex>> {
+        let dto: IndexDto =
+            serde_json::from_str(s).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if dto.version != INDEX_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported sstable index version",
+            ));
+        }
+        let bits = base64::engine::general_purpose::STANDARD
+            .decode(dto.bloom.bits)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if dto.bloom.m < 1024 || dto.bloom.k == 0 || bits.len() != ((dto.bloom.m + 7) / 8) as usize
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupt bloom params",
+            ));
+        }
+        let bloom = BloomFilter {
+            m: dto.bloom.m,
+            k: dto.bloom.k,
+            seed: dto.bloom.seed,
+            bits,
+        };
+        let row_groups = dto
+            .row_groups
+            .iter()
+            .map(from_row_group_dto)
+            .collect::<io::Result<_>>()?;
+        Ok(Arc::new(SstableIndex { bloom, row_groups }))
+    }
+
+    pub(crate) fn load_from_file(path: &Path) -> io::Result<Arc<SstableIndex>> {
+        let file = File::open(path)?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let json = builder
+            .schema()
+            .metadata()
+            .get(INDEX_META_KEY)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "sst file lacks index metadata")
+            })?;
+        Self::from_json(json)
+    }
+
+    pub(crate) fn bounds(&self) -> (Key, Key, usize) {
+        let min = self
+            .row_groups
+            .first()
+            .map(|rg| rg.min_key.clone())
+            .unwrap_or_default();
+        let max = self
+            .row_groups
+            .last()
+            .map(|rg| rg.max_key.clone())
+            .unwrap_or_default();
+        let count = self.row_groups.iter().map(|rg| rg.num_rows).sum();
+        (min, max, count)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct IndexDto {
+    version: u32,
+    bloom: BloomDto,
+    row_groups: Vec<RowGroupDto>,
+}
+#[derive(Serialize, Deserialize)]
+struct BloomDto {
+    m: u64,
+    k: u32,
+    seed: u64,
+    bits: String,
+}
+#[derive(Serialize, Deserialize)]
+struct RowGroupDto {
+    num_rows: usize,
+    min_key: HexKeyDto,
+    max_key: HexKeyDto,
+}
+#[derive(Serialize, Deserialize)]
+struct HexKeyDto {
+    tag: String,
+    ts: i64,
+}
+
+fn hex_key(k: &Key) -> HexKeyDto {
+    HexKeyDto {
+        tag: to_hex(&k.0),
+        ts: k.1,
+    }
+}
+fn from_row_group_dto(d: &RowGroupDto) -> io::Result<RowGroupMeta> {
+    Ok(RowGroupMeta {
+        num_rows: d.num_rows,
+        min_key: (from_hex(&d.min_key.tag)?, d.min_key.ts),
+        max_key: (from_hex(&d.max_key.tag)?, d.max_key.ts),
+    })
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    let mut result = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        write!(result, "{:02x}", b).unwrap();
+    }
+    result
+}
+
+fn from_hex(s: &str) -> io::Result<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "hex string has odd length",
+        ));
+    }
+
+    let mut chars = s.chars();
+    let mut result = Vec::with_capacity(s.len() / 2);
+
+    while let Some(high) = chars.next() {
+        let low = chars.next().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "hex string is incomplete")
+        })?;
+        let high_val = high
+            .to_digit(16)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid hex character"))?;
+        let low_val = low
+            .to_digit(16)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid hex character"))?;
+        result.push((high_val * 16 + low_val) as u8);
+    }
+
+    Ok(result)
+}
 
 fn key_at(view: &BatchView, schema: &TableSchema, i: usize) -> Key {
     let tags = if schema.primary_key.len() == 1 {
@@ -54,6 +236,64 @@ fn value_at(
     Some(schema.encode_fields(&cells))
 }
 
+fn build_batch(rows: &[(Key, Option<Value>)], schema: &TableSchema) -> io::Result<RecordBatch> {
+    let ncols = schema.columns.len();
+    let mut cols: Vec<Vec<Option<Vec<u8>>>> = vec![Vec::with_capacity(rows.len()); ncols];
+
+    let nfields = schema
+        .columns
+        .iter()
+        .filter(|c| c.semantic == SemanticType::Field)
+        .count();
+    let single_field_col = (nfields == 1).then(|| {
+        schema
+            .columns
+            .iter()
+            .position(|c| c.semantic == SemanticType::Field)
+            .unwrap()
+    });
+
+    for (key, value) in rows {
+        if schema.primary_key.len() == 1 {
+            cols[schema.primary_key[0]].push(Some(key.0.clone()));
+        } else {
+            let tags = schema.decode_tags(&key.0);
+            for (j, &idx) in schema.primary_key.iter().enumerate() {
+                cols[idx].push(Some(tags[j].clone()));
+            }
+        }
+        cols[schema.time_index].push(Some(key.1.to_le_bytes().to_vec()));
+        match value {
+            Some(blob) => match single_field_col {
+                Some(idx) => cols[idx].push(Some(blob.clone())),
+                None => {
+                    let fcells = schema.decode_fields(blob);
+                    let mut k = 0;
+                    for (i, col) in schema.columns.iter().enumerate() {
+                        if col.semantic == SemanticType::Field {
+                            cols[i].push(Some(fcells[k].clone()));
+                            k += 1;
+                        }
+                    }
+                }
+            },
+            None => {
+                for (i, col) in schema.columns.iter().enumerate() {
+                    if col.semantic == SemanticType::Field {
+                        cols[i].push(None);
+                    }
+                }
+            }
+        }
+    }
+
+    let arrays: Vec<ArrayRef> = (0..ncols)
+        .map(|i| cells_to_array(&schema.columns[i].data_type, &cols[i]))
+        .collect();
+    RecordBatch::try_new(Arc::new(schema.arrow_schema()), arrays)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
 #[derive(Clone, Debug)]
 pub struct SSTable {
     id: usize,
@@ -62,16 +302,18 @@ pub struct SSTable {
     max_key: Key,
     entry_count: usize,
     schema: Arc<TableSchema>,
+    index: Arc<SstableIndex>,
 }
 
 impl SSTable {
-    pub fn new(
+    pub(crate) fn new(
         id: usize,
         path: PathBuf,
         min_key: Key,
         max_key: Key,
         entry_count: usize,
         schema: Arc<TableSchema>,
+        index: Arc<SstableIndex>,
     ) -> Self {
         SSTable {
             id,
@@ -80,6 +322,7 @@ impl SSTable {
             max_key,
             entry_count,
             schema,
+            index,
         }
     }
 
@@ -90,119 +333,95 @@ impl SSTable {
         include_tombstones: bool,
         schema: &TableSchema,
     ) -> io::Result<Self> {
-        let ncols = schema.columns.len();
-        let mut cols: Vec<Vec<Option<Vec<u8>>>> = vec![Vec::with_capacity(skiplist.len()); ncols];
-        let mut min_key = None;
-        let mut max_key = None;
-        let mut count = 0;
+        let seed = rand::random::<u64>();
+        let mut bloom = BloomFilter::new(skiplist.len(), 0.01, seed);
 
-        let nfields = schema
-            .columns
-            .iter()
-            .filter(|c| c.semantic == SemanticType::Field)
-            .count();
-        let single_field_col = (nfields == 1).then(|| {
-            schema
-                .columns
-                .iter()
-                .position(|c| c.semantic == SemanticType::Field)
-                .unwrap()
-        });
+        let mut row_groups: Vec<RowGroupMeta> = Vec::new();
+        let mut chunk_rows: usize = 0;
+        let mut chunk_min: Option<Key> = None;
+        let mut chunk_max: Option<Key> = None;
 
         for (key, value) in skiplist.iter() {
             if !include_tombstones && value.is_none() {
                 continue;
             }
-            if schema.primary_key.len() == 1 {
-                cols[schema.primary_key[0]].push(Some(key.0.clone()));
-            } else {
-                let tags = schema.decode_tags(&key.0);
-                for (j, &idx) in schema.primary_key.iter().enumerate() {
-                    cols[idx].push(Some(tags[j].clone()));
-                }
+
+            bloom.insert(&key);
+            if chunk_min.is_none() {
+                chunk_min = Some(key.clone());
             }
-            cols[schema.time_index].push(Some(key.1.to_le_bytes().to_vec()));
-            match value {
-                Some(blob) => match single_field_col {
-                    Some(idx) => cols[idx].push(Some(blob.clone())),
-                    None => {
-                        let fcells = schema.decode_fields(&blob);
-                        let mut k = 0;
-                        for (i, col) in schema.columns.iter().enumerate() {
-                            if col.semantic == SemanticType::Field {
-                                cols[i].push(Some(fcells[k].clone()));
-                                k += 1;
-                            }
-                        }
-                    }
-                },
-                None => {
-                    for (i, col) in schema.columns.iter().enumerate() {
-                        if col.semantic == SemanticType::Field {
-                            cols[i].push(None);
-                        }
-                    }
-                }
+            chunk_max = Some(key.clone());
+            chunk_rows += 1;
+            if chunk_rows == CHUNK_ROWS {
+                row_groups.push(RowGroupMeta {
+                    num_rows: chunk_rows,
+                    min_key: chunk_min.take().unwrap(),
+                    max_key: chunk_max.take().unwrap(),
+                });
+                chunk_rows = 0;
             }
-            if min_key.is_none() || key < *min_key.as_ref().unwrap() {
-                min_key = Some(key.clone());
-            }
-            if max_key.is_none() || key > *max_key.as_ref().unwrap() {
-                max_key = Some(key.clone());
-            }
-            count += 1;
         }
 
-        let arrays: Vec<ArrayRef> = (0..ncols)
-            .map(|i| cells_to_array(&schema.columns[i].data_type, &cols[i]))
-            .collect();
-        let batch = RecordBatch::try_new(Arc::new(schema.arrow_schema()), arrays)
+        if chunk_rows > 0 {
+            row_groups.push(RowGroupMeta {
+                num_rows: chunk_rows,
+                min_key: chunk_min.unwrap(),
+                max_key: chunk_max.unwrap(),
+            });
+        }
+
+        let index = SstableIndex { bloom, row_groups };
+        let meta = HashMap::from([(INDEX_META_KEY.to_string(), index.to_json()?)]);
+        let arrow_schema = schema.arrow_schema().with_metadata(meta);
+
+        let final_path = path.as_ref().to_path_buf();
+        let tmp_path = final_path.with_extension("sst.tmp");
+        let file = File::create(&tmp_path)?;
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(CHUNK_ROWS))
+            .build();
+        let mut writer = ArrowWriter::try_new(file, Arc::new(arrow_schema), Some(props))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        let file = File::create(path.as_ref())?;
-        let props = WriterProperties::builder().build();
-        let mut writer = ArrowWriter::try_new(file, Arc::new(schema.arrow_schema()), Some(props))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut current: Vec<(Key, Option<Value>)> = Vec::with_capacity(CHUNK_ROWS);
+        for (key, value) in skiplist.iter() {
+            if !include_tombstones && value.is_none() {
+                continue;
+            }
+            current.push((key.clone(), value.clone()));
+            if current.len() == CHUNK_ROWS {
+                writer
+                    .write(&build_batch(&current, schema)?)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                current.clear();
+            }
+        }
 
-        writer
-            .write(&batch)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if !current.is_empty() {
+            writer
+                .write(&build_batch(&current, schema)?)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        }
         writer
             .close()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        fs::rename(&tmp_path, &final_path)?;
 
+        let (min_key, max_key, entry_count) = index.bounds();
         Ok(SSTable {
             id,
-            path: path.as_ref().to_path_buf(),
-            min_key: min_key.unwrap_or_default(),
-            max_key: max_key.unwrap_or_default(),
-            entry_count: count,
+            path: final_path,
+            min_key,
+            max_key,
+            entry_count,
             schema: Arc::new(schema.clone()),
+            index: Arc::new(index),
         })
     }
 
     pub fn open_from_path(path: impl AsRef<Path>, schema: &TableSchema) -> io::Result<Self> {
-        let file = File::open(&path)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let reader = builder.build()?;
-        let mut min_key: Option<Key> = None;
-        let mut max_key: Option<Key> = None;
-        let mut count = 0;
-        for batch in reader {
-            let batch = batch.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let view = BatchView::new(&batch, schema);
-            for i in 0..batch.num_rows() {
-                let k = key_at(&view, schema, i);
-                if min_key.is_none() || k < *min_key.as_ref().unwrap() {
-                    min_key = Some(k.clone());
-                }
-                if max_key.is_none() || k > *max_key.as_ref().unwrap() {
-                    max_key = Some(k.clone());
-                }
-                count += 1;
-            }
-        }
+        let index = SstableIndex::load_from_file(path.as_ref())?;
+        let (min_key, max_key, entry_count) = index.bounds();
         let id = path
             .as_ref()
             .file_stem()
@@ -214,11 +433,19 @@ impl SSTable {
         Ok(SSTable::new(
             id,
             path.as_ref().to_path_buf(),
-            min_key.unwrap_or_default(),
-            max_key.unwrap_or_default(),
-            count,
+            min_key,
+            max_key,
+            entry_count,
             Arc::new(schema.clone()),
+            index,
         ))
+    }
+
+    fn candidate_row_group(&self, key: &Key) -> Option<usize> {
+        let rgs = &self.index.row_groups;
+        let i = rgs.partition_point(|rg| rg.max_key < *key);
+        let rg = rgs.get(i)?;
+        (rg.min_key <= *key).then_some(i)
     }
 
     pub fn get(&self, key: &Key) -> io::Result<Option<Option<Value>>> {
@@ -226,10 +453,18 @@ impl SSTable {
             return Ok(None);
         }
 
+        if !self.index.bloom.contains(key) {
+            return Ok(None);
+        }
+
+        let Some(rg) = self.candidate_row_group(key) else {
+            return Ok(None);
+        };
+
         let file = File::open(&self.path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let reader = builder.build()?;
+        let reader = builder.with_row_groups(vec![rg]).build()?;
 
         for batch_result in reader {
             let batch = batch_result.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -257,15 +492,31 @@ impl SSTable {
         Ok(None)
     }
 
+    fn overlapping_row_groups(&self, start: &Key, end: &Key) -> Option<(usize, usize)> {
+        let rgs = &self.index.row_groups;
+        if rgs.is_empty() {
+            return None;
+        }
+        let first = rgs.partition_point(|rg| rg.max_key < *start);
+        let last = rgs
+            .partition_point(|rg| rg.min_key <= *end)
+            .saturating_sub(1);
+        (first <= last).then_some((first, last))
+    }
+
     pub fn scan(&self, start: &Key, end: &Key) -> io::Result<Vec<(Key, Option<Value>)>> {
         if self.entry_count == 0 || start > end || end < &self.min_key || start > &self.max_key {
             return Ok(Vec::new());
         }
 
+        let Some((first, last)) = self.overlapping_row_groups(start, end) else {
+            return Ok(Vec::new());
+        };
+
         let file = File::open(&self.path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let reader = builder.build()?;
+        let reader = builder.with_row_groups((first..=last).collect()).build()?;
 
         let mut results = Vec::new();
         for batch_result in reader {
@@ -302,10 +553,18 @@ impl SSTable {
                 self.schema.clone(),
             ));
         }
+
+        let Some((first, last)) = self.overlapping_row_groups(start, end) else {
+            return Ok(SSTableIter::empty(
+                start.clone(),
+                end.clone(),
+                self.schema.clone(),
+            ));
+        };
         let file = File::open(&self.path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let reader = builder.build()?;
+        let reader = builder.with_row_groups((first..=last).collect()).build()?;
         Ok(SSTableIter {
             inner: Box::new(
                 reader.map(|r| r.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))),
@@ -626,6 +885,169 @@ mod tests {
         assert_eq!(reopened.min_key(), sst.min_key());
         let got = sst.scan(sst.min_key(), sst.max_key())?;
         assert_eq!(got.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn index_json_roundtrip() -> io::Result<()> {
+        let mut bloom = BloomFilter::new(100, 0.01, 123);
+        for i in 0..100 {
+            bloom.insert(&k((i % 5) as u8, i));
+        }
+        let index = SstableIndex {
+            bloom,
+            row_groups: vec![
+                RowGroupMeta {
+                    num_rows: 50,
+                    min_key: k(0, 0),
+                    max_key: k(4, 49),
+                },
+                RowGroupMeta {
+                    num_rows: 50,
+                    min_key: k(4, 50),
+                    max_key: k(9, 99),
+                },
+            ],
+        };
+        let json = index.to_json()?;
+        let decoded = SstableIndex::from_json(&json)?;
+        assert_eq!(decoded.bloom.m, index.bloom.m);
+        assert_eq!(decoded.bloom.k, index.bloom.k);
+        assert_eq!(decoded.bloom.seed, index.bloom.seed);
+        assert_eq!(decoded.bloom.bits, index.bloom.bits);
+        assert_eq!(decoded.row_groups, index.row_groups);
+        for i in 0..100 {
+            assert!(decoded.bloom.contains(&k((i % 5) as u8, i)));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn index_json_rejects_bad_version() {
+        let err = SstableIndex::from_json(
+            r#"{"version":999,"bloom":{"m":1024,"k":1,"seed":0,"bits":""},"row_groups":[]}"#,
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn index_json_rejects_bad_base64() {
+        let err = SstableIndex::from_json(
+            r#"{"version":1,"bloom":{"m":1024,"k":1,"seed":0,"bits":"!!!not-base64!!!"},"row_groups":[]}"#,
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn index_json_rejects_bad_hex() {
+        let err = SstableIndex::from_json(
+            r#"{"version":1,"bloom":{"m":1024,"k":1,"seed":0,"bits":"AA=="},
+                "row_groups":[{"num_rows":1,"min_key":{"tag":"zz","ts":0},"max_key":{"tag":"aa","ts":1}}]}"#,
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_sstable_multi_chunk_roundtrip() -> io::Result<()> {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("1.sst");
+        let list = SkipList::new();
+        for i in 0..20_000i64 {
+            list.insert((vec![0], i), Some(v(&format!("v{}", i))));
+        }
+        let sst =
+            SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())?;
+        assert_eq!(sst.entry_count(), 20_000);
+        assert_eq!(sst.min_key(), &k(0, 0));
+        assert_eq!(sst.max_key(), &k(0, 19_999));
+
+        for &i in &[0i64, 8191, 8192, 8193, 19_999] {
+            assert_eq!(sst.get(&k(0, i))?.unwrap(), Some(v(&format!("v{}", i))));
+        }
+
+        let reopened = SSTable::open_from_path(&path, &TableSchema::default_table())?;
+        assert_eq!(reopened.entry_count(), 20_000);
+        assert_eq!(reopened.get(&k(0, 12_345))?.unwrap(), Some(v("v12345")));
+        Ok(())
+    }
+
+    #[test]
+    fn test_sstable_empty_skiplist() -> io::Result<()> {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("2.sst");
+        let list = SkipList::new();
+        let sst =
+            SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())?;
+        assert_eq!(sst.entry_count(), 0);
+
+        let reopened = SSTable::open_from_path(&path, &TableSchema::default_table())?;
+        assert_eq!(reopened.entry_count(), 0);
+        assert_eq!(reopened.get(&k(5, 0))?, None);
+        assert!(reopened.scan(&k(0, 0), &k(9, 9))?.is_empty());
+        assert!(reopened.scan_iter(&k(0, 0), &k(9, 9))?.next().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_sstable_atomic_write_leaves_no_tmp() -> io::Result<()> {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("3.sst");
+        let list = SkipList::new();
+        list.insert(k(1, 0), Some(v("a")));
+        SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())?;
+        assert!(path.exists());
+        assert!(!dir.path().join("3.sst.tmp").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn test_sstable_scan_across_chunks() -> io::Result<()> {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("4.sst");
+        let list = SkipList::new();
+        for i in 0..20_000i64 {
+            list.insert((vec![0], i), Some(v(&format!("v{}", i))));
+        }
+        let sst =
+            SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())?;
+
+        let single = sst.scan(&k(0, 100), &k(0, 200))?;
+        assert_eq!(single.len(), 101);
+        assert_eq!(single[0].0, k(0, 100));
+        assert_eq!(single[100].0, k(0, 200));
+
+        let cross = sst.scan(&k(0, 8190), &k(0, 8193))?;
+        assert_eq!(cross.len(), 4);
+        assert_eq!(cross[0].0, k(0, 8190));
+        assert_eq!(cross[3].0, k(0, 8193));
+
+        let full = sst.scan(&k(0, 0), &k(0, 19_999))?;
+        assert_eq!(full.len(), 20_000);
+        let sub: Vec<Key> = full
+            .iter()
+            .map(|(k, _)| k.clone())
+            .filter(|key| key.1 >= 8190 && key.1 <= 8193)
+            .collect();
+        assert_eq!(sub.len(), 4);
+        assert_eq!(sub[0], k(0, 8190));
+        assert_eq!(sub[3], k(0, 8193));
+        Ok(())
+    }
+
+    #[test]
+    fn test_sstable_missing_index_metadata_errors() -> io::Result<()> {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("5.sst");
+        let schema = TableSchema::default_table();
+
+        let file = File::create(&path)?;
+        let writer = ArrowWriter::try_new(file, Arc::new(schema.arrow_schema()), None)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        writer
+            .close()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        assert!(SSTable::open_from_path(&path, &schema).is_err());
         Ok(())
     }
 }
