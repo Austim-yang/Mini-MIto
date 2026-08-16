@@ -20,7 +20,7 @@ fn bench_insert(c: &mut Criterion) {
                 || SkipList::new(),
                 |list| {
                     for i in 0..size {
-                        list.insert(key(black_box(i)), Some(value(black_box(i))));
+                        list.insert(key(black_box(i)), i, Some(value(black_box(i))));
                     }
                 },
                 criterion::BatchSize::SmallInput,
@@ -35,7 +35,7 @@ fn bench_get(c: &mut Criterion) {
     let size = 10_000;
     let list = SkipList::new();
     for i in 0..size {
-        list.insert(key(i), Some(value(i)));
+        list.insert(key(i), i, Some(value(i)));
     }
     let mut rng = rng();
     group.bench_function("hit", |b| {
@@ -56,7 +56,7 @@ fn bench_get(c: &mut Criterion) {
 fn bench_iter(c: &mut Criterion) {
     let list = SkipList::new();
     for i in 0..10_000 {
-        list.insert(key(i), Some(value(i)));
+        list.insert(key(i),i,  Some(value(i)));
     }
     c.bench_function("skiplist_iter", |b| {
         b.iter(|| {

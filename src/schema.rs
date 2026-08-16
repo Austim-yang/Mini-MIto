@@ -1,7 +1,8 @@
-use std::{sync::Arc, vec};
+use std::{sync::Arc, unreachable, vec};
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, TimestampNanosecondArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int8Array, Int64Array, RecordBatch,
+    StringArray, TimestampNanosecondArray,
 };
 use arrow_schema::{DataType, Field, Schema};
 
@@ -189,6 +190,7 @@ pub(crate) enum ColumnView<'a> {
     Binary(&'a BinaryArray),
     Utf8(&'a StringArray),
     Int64(&'a Int64Array),
+    Int8(&'a Int8Array),
     Float64(&'a Float64Array),
     Boolean(&'a BooleanArray),
     Timestamp(&'a TimestampNanosecondArray),
@@ -200,11 +202,18 @@ impl<'a> ColumnView<'a> {
             DataType::Binary => Self::Binary(arr.as_any().downcast_ref::<BinaryArray>().unwrap()),
             DataType::Utf8 => Self::Utf8(arr.as_any().downcast_ref::<StringArray>().unwrap()),
             DataType::Int64 => Self::Int64(arr.as_any().downcast_ref::<Int64Array>().unwrap()),
-            DataType::Float64 => Self::Float64(arr.as_any().downcast_ref::<Float64Array>().unwrap()),
-            DataType::Boolean => Self::Boolean(arr.as_any().downcast_ref::<BooleanArray>().unwrap()),
-            DataType::Timestamp(..) => {
-                Self::Timestamp(arr.as_any().downcast_ref::<TimestampNanosecondArray>().unwrap())
+            DataType::Int8 => Self::Int8(arr.as_any().downcast_ref::<Int8Array>().unwrap()),
+            DataType::Float64 => {
+                Self::Float64(arr.as_any().downcast_ref::<Float64Array>().unwrap())
             }
+            DataType::Boolean => {
+                Self::Boolean(arr.as_any().downcast_ref::<BooleanArray>().unwrap())
+            }
+            DataType::Timestamp(..) => Self::Timestamp(
+                arr.as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .unwrap(),
+            ),
             other => unimplemented!("column view for {other:?}"),
         }
     }
@@ -214,6 +223,7 @@ impl<'a> ColumnView<'a> {
             Self::Binary(a) => a.is_null(i),
             Self::Utf8(a) => a.is_null(i),
             Self::Int64(a) => a.is_null(i),
+            Self::Int8(a) => a.is_null(i),
             Self::Float64(a) => a.is_null(i),
             Self::Boolean(a) => a.is_null(i),
             Self::Timestamp(a) => a.is_null(i),
@@ -225,6 +235,7 @@ impl<'a> ColumnView<'a> {
             Self::Binary(a) => (!a.is_null(i)).then(|| a.value(i).to_vec()),
             Self::Utf8(a) => (!a.is_null(i)).then(|| a.value(i).as_bytes().to_vec()),
             Self::Int64(a) => (!a.is_null(i)).then(|| a.value(i).to_le_bytes().to_vec()),
+            Self::Int8(a) => (!a.is_null(i)).then(|| a.value(i).to_le_bytes().to_vec()),
             Self::Float64(a) => (!a.is_null(i)).then(|| a.value(i).to_le_bytes().to_vec()),
             Self::Boolean(a) => (!a.is_null(i)).then(|| vec![a.value(i) as u8]),
             Self::Timestamp(a) => (!a.is_null(i)).then(|| a.value(i).to_le_bytes().to_vec()),
@@ -234,14 +245,18 @@ impl<'a> ColumnView<'a> {
 
 pub(crate) struct BatchView<'a> {
     cols: Vec<ColumnView<'a>>,
+    user_cols: usize,
 }
 
 impl<'a> BatchView<'a> {
     pub fn new(batch: &'a RecordBatch, schema: &TableSchema) -> Self {
-        let cols = (0..schema.columns.len())
-            .map(|c| ColumnView::from_array(batch.column(c), &schema.columns[c].data_type))
+        let cols = (0..batch.num_columns())
+            .map(|c| ColumnView::from_array(batch.column(c), batch.schema().field(c).data_type()))
             .collect();
-        Self { cols }
+        Self {
+            cols,
+            user_cols: schema.columns.len(),
+        }
     }
 
     pub fn cell(&self, col: usize, i: usize) -> Option<Vec<u8>> {
@@ -257,6 +272,20 @@ impl<'a> BatchView<'a> {
             ColumnView::Int64(a) => a.value(i),
             ColumnView::Timestamp(a) => a.value(i),
             _ => unreachable!("time index column must be Int64 or Timestamp"),
+        }
+    }
+
+    pub fn seq_value(&self, i: usize) -> i64 {
+        match &self.cols[self.user_cols] {
+            ColumnView::Int64(a) => a.value(i),
+            _ => unreachable!("__seq column must be Int64"),
+        }
+    }
+
+    pub fn op_type(&self, i: usize) -> i8 {
+        match &self.cols[self.user_cols + 1] {
+            ColumnView::Int8(a) => a.value(i),
+            _ => unreachable!("__op_type column must be Int8"),
         }
     }
 }

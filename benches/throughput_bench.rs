@@ -17,7 +17,7 @@ fn value(i: u64) -> Value {
 fn build_skiplist(n: usize) -> SkipList {
     let list = SkipList::new();
     for i in 0..n {
-        list.insert(key(i as u64), Some(value(i as u64)));
+        list.insert(key(i as u64), i as u64, Some(value(i as u64)));
     }
     list
 }
@@ -30,7 +30,7 @@ fn bench_skiplist_insert(c: &mut Criterion) {
             b.iter(|| {
                 let list = SkipList::new();
                 for i in 0..size {
-                    list.insert(key(i), Some(value(i)));
+                    list.insert(key(i), i, Some(value(i)));
                 }
                 black_box(list);
             });
@@ -112,7 +112,7 @@ fn bench_compaction(c: &mut Criterion) {
             for i in 0..per_sst_size {
                 let key = key((start + i) as u64);
                 let value = value((start + i) as u64);
-                list.insert(key, Some(value));
+                list.insert(key, i, Some(value));
             }
             let path = dir.path().join(format!("{}.sst", id));
             let sst = SSTable::create_from_skiplist(&list, id as usize, &path, true, &TableSchema::default_table()).unwrap();
@@ -127,8 +127,8 @@ fn bench_compaction(c: &mut Criterion) {
                     let merged = SkipList::new();
                     for sst in ssts {
                         let pairs = sst.scan(sst.min_key(), sst.max_key()).unwrap();
-                        for (k, v) in pairs {
-                            merged.insert(k, v);
+                        for (k, seq, v) in pairs {
+                            merged.insert(k, seq, v);
                         }
                     }
                     let new_path = dir.join("merged.sst");
@@ -148,6 +148,7 @@ fn bench_wal_append_batch(c: &mut Criterion) {
         let ops: Vec<Operation> = (0..*batch_size)
             .map(|i| Operation::Insert {
                 key: key(i),
+                seq: i,
                 value: value(i),
             })
             .collect();

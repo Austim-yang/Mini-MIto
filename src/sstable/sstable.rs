@@ -8,7 +8,8 @@ use std::{
     vec,
 };
 
-use arrow::array::{ArrayRef, RecordBatch};
+use arrow::array::{ArrayRef, Int8Array, Int64Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
 use base64::Engine;
 use parquet::{
     arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
@@ -25,7 +26,11 @@ use crate::{
 
 const CHUNK_ROWS: usize = 8192;
 const INDEX_META_KEY: &str = "sstable.index";
-const INDEX_VERSION: u32 = 1;
+const INDEX_VERSION: u32 = 2;
+const SEQ_COL: &str = "__seq";
+const OP_COL: &str = "__op_type";
+const OP_PUT: i8 = 0;
+const OP_DELETE: i8 = 1;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RowGroupMeta {
@@ -38,6 +43,7 @@ pub(crate) struct RowGroupMeta {
 pub(crate) struct SstableIndex {
     pub(crate) bloom: BloomFilter,
     pub(crate) row_groups: Vec<RowGroupMeta>,
+    pub(crate) max_seq: u64,
 }
 
 impl SstableIndex {
@@ -59,6 +65,7 @@ impl SstableIndex {
                     max_key: hex_key(&rg.max_key),
                 })
                 .collect(),
+            max_seq: self.max_seq,
         };
         serde_json::to_string(&dto).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
@@ -93,7 +100,11 @@ impl SstableIndex {
             .iter()
             .map(from_row_group_dto)
             .collect::<io::Result<_>>()?;
-        Ok(Arc::new(SstableIndex { bloom, row_groups }))
+        Ok(Arc::new(SstableIndex {
+            bloom,
+            row_groups,
+            max_seq: dto.max_seq,
+        }))
     }
 
     pub(crate) fn load_from_file(path: &Path) -> io::Result<Arc<SstableIndex>> {
@@ -131,6 +142,7 @@ struct IndexDto {
     version: u32,
     bloom: BloomDto,
     row_groups: Vec<RowGroupDto>,
+    max_seq: u64,
 }
 #[derive(Serialize, Deserialize)]
 struct BloomDto {
@@ -220,6 +232,9 @@ fn value_at(
     field_cols: &[usize],
     i: usize,
 ) -> Option<Value> {
+    if view.op_type(i) == OP_DELETE {
+        return None;
+    }
     if field_cols.is_empty() {
         return Some(Vec::new());
     }
@@ -236,7 +251,22 @@ fn value_at(
     Some(schema.encode_fields(&cells))
 }
 
-fn build_batch(rows: &[(Key, Option<Value>)], schema: &TableSchema) -> io::Result<RecordBatch> {
+fn sst_schema(schema: &TableSchema) -> Schema {
+    let mut fields: Vec<Field> = schema
+        .arrow_schema()
+        .fields()
+        .iter()
+        .map(|f| (**f).clone())
+        .collect();
+    fields.push(Field::new(SEQ_COL, DataType::Int64, false));
+    fields.push(Field::new(OP_COL, DataType::Int8, false));
+    Schema::new(fields)
+}
+
+fn build_batch(
+    rows: &[(Key, u64, Option<Value>)],
+    schema: &TableSchema,
+) -> io::Result<RecordBatch> {
     let ncols = schema.columns.len();
     let mut cols: Vec<Vec<Option<Vec<u8>>>> = vec![Vec::with_capacity(rows.len()); ncols];
 
@@ -253,7 +283,7 @@ fn build_batch(rows: &[(Key, Option<Value>)], schema: &TableSchema) -> io::Resul
             .unwrap()
     });
 
-    for (key, value) in rows {
+    for (key, _seq, value) in rows {
         if schema.primary_key.len() == 1 {
             cols[schema.primary_key[0]].push(Some(key.0.clone()));
         } else {
@@ -287,10 +317,16 @@ fn build_batch(rows: &[(Key, Option<Value>)], schema: &TableSchema) -> io::Resul
         }
     }
 
-    let arrays: Vec<ArrayRef> = (0..ncols)
+    let mut arrays: Vec<ArrayRef> = (0..ncols)
         .map(|i| cells_to_array(&schema.columns[i].data_type, &cols[i]))
         .collect();
-    RecordBatch::try_new(Arc::new(schema.arrow_schema()), arrays)
+    arrays.push(Arc::new(Int64Array::from_iter(
+        rows.iter().map(|(_, seq, _)| Some(*seq as i64)),
+    )));
+    arrays.push(Arc::new(Int8Array::from_iter(rows.iter().map(
+        |(_, _, value)| Some(if value.is_some() { OP_PUT } else { OP_DELETE }),
+    ))));
+    RecordBatch::try_new(Arc::new(sst_schema(schema)), arrays)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
@@ -300,6 +336,7 @@ pub struct SSTable {
     path: PathBuf,
     min_key: Key,
     max_key: Key,
+    max_seq: u64,
     entry_count: usize,
     schema: Arc<TableSchema>,
     index: Arc<SstableIndex>,
@@ -321,6 +358,7 @@ impl SSTable {
             min_key,
             max_key,
             entry_count,
+            max_seq: index.max_seq,
             schema,
             index,
         }
@@ -337,15 +375,17 @@ impl SSTable {
         let mut bloom = BloomFilter::new(skiplist.len(), 0.01, seed);
 
         let mut row_groups: Vec<RowGroupMeta> = Vec::new();
+        let mut max_seq: u64 = 0;
         let mut chunk_rows: usize = 0;
         let mut chunk_min: Option<Key> = None;
         let mut chunk_max: Option<Key> = None;
 
-        for (key, value) in skiplist.iter() {
+        for (key, seq, value) in skiplist.iter() {
             if !include_tombstones && value.is_none() {
                 continue;
             }
 
+            max_seq = max_seq.max(seq);
             bloom.insert(&key);
             if chunk_min.is_none() {
                 chunk_min = Some(key.clone());
@@ -370,9 +410,13 @@ impl SSTable {
             });
         }
 
-        let index = SstableIndex { bloom, row_groups };
+        let index = SstableIndex {
+            bloom,
+            row_groups,
+            max_seq,
+        };
         let meta = HashMap::from([(INDEX_META_KEY.to_string(), index.to_json()?)]);
-        let arrow_schema = schema.arrow_schema().with_metadata(meta);
+        let arrow_schema = sst_schema(schema).with_metadata(meta);
 
         let final_path = path.as_ref().to_path_buf();
         let tmp_path = final_path.with_extension("sst.tmp");
@@ -383,12 +427,12 @@ impl SSTable {
         let mut writer = ArrowWriter::try_new(file, Arc::new(arrow_schema), Some(props))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        let mut current: Vec<(Key, Option<Value>)> = Vec::with_capacity(CHUNK_ROWS);
-        for (key, value) in skiplist.iter() {
+        let mut current: Vec<(Key, u64, Option<Value>)> = Vec::with_capacity(CHUNK_ROWS);
+        for (key, seq, value) in skiplist.iter() {
             if !include_tombstones && value.is_none() {
                 continue;
             }
-            current.push((key.clone(), value.clone()));
+            current.push((key.clone(), seq, value.clone()));
             if current.len() == CHUNK_ROWS {
                 writer
                     .write(&build_batch(&current, schema)?)
@@ -414,6 +458,7 @@ impl SSTable {
             min_key,
             max_key,
             entry_count,
+            max_seq,
             schema: Arc::new(schema.clone()),
             index: Arc::new(index),
         })
@@ -448,7 +493,7 @@ impl SSTable {
         (rg.min_key <= *key).then_some(i)
     }
 
-    pub fn get(&self, key: &Key) -> io::Result<Option<Option<Value>>> {
+    pub fn get(&self, key: &Key) -> io::Result<Option<(u64, Option<Value>)>> {
         if self.entry_count == 0 || key < &self.min_key || key > &self.max_key {
             return Ok(None);
         }
@@ -484,7 +529,8 @@ impl SSTable {
                     return Ok(None);
                 }
                 if k == *key {
-                    return Ok(Some(value_at(&view, &self.schema, &field_cols, i)));
+                    let seq = view.seq_value(i) as u64;
+                    return Ok(Some((seq, value_at(&view, &self.schema, &field_cols, i))));
                 }
             }
         }
@@ -504,7 +550,7 @@ impl SSTable {
         (first <= last).then_some((first, last))
     }
 
-    pub fn scan(&self, start: &Key, end: &Key) -> io::Result<Vec<(Key, Option<Value>)>> {
+    pub fn scan(&self, start: &Key, end: &Key) -> io::Result<Vec<(Key, u64, Option<Value>)>> {
         if self.entry_count == 0 || start > end || end < &self.min_key || start > &self.max_key {
             return Ok(Vec::new());
         }
@@ -537,7 +583,11 @@ impl SSTable {
                     return Ok(results);
                 }
                 if k >= *start {
-                    results.push((k, value_at(&view, &self.schema, &field_cols, i)));
+                    results.push((
+                        k,
+                        view.seq_value(i) as u64,
+                        value_at(&view, &self.schema, &field_cols, i),
+                    ));
                 }
             }
         }
@@ -589,6 +639,10 @@ impl SSTable {
         self.entry_count
     }
 
+    pub fn max_seq(&self) -> u64 {
+        self.max_seq
+    }
+
     pub fn min_key(&self) -> &Key {
         &self.min_key
     }
@@ -600,7 +654,7 @@ impl SSTable {
 
 pub struct SSTableIter {
     inner: Box<dyn Iterator<Item = io::Result<RecordBatch>> + Send>,
-    current: Vec<(Key, Option<Value>)>,
+    current: Vec<(Key, u64, Option<Value>)>,
     pos: usize,
     start: Key,
     end: Key,
@@ -642,8 +696,11 @@ impl SSTableIter {
                             break;
                         }
                         if k >= self.start {
-                            self.current
-                                .push((k, value_at(&view, &self.schema, &field_cols, i)));
+                            self.current.push((
+                                k,
+                                view.seq_value(i) as u64,
+                                value_at(&view, &self.schema, &field_cols, i),
+                            ));
                         }
                     }
                 }
@@ -654,7 +711,7 @@ impl SSTableIter {
 }
 
 impl Iterator for SSTableIter {
-    type Item = (Key, Option<Value>);
+    type Item = (Key, u64, Option<Value>);
     fn next(&mut self) -> Option<Self::Item> {
         if self.pos >= self.current.len() && !(self.fill().ok()?) {
             return None;
@@ -686,9 +743,9 @@ mod tests {
         let path = dir.path().join("test.sst");
 
         let skiplist = SkipList::new();
-        skiplist.insert(k(10, 0), Some(v("ten")));
-        skiplist.insert(k(20, 0), Some(v("twenty")));
-        skiplist.insert(k(30, 0), Some(v("thirty")));
+        skiplist.insert(k(10, 0), 1, Some(v("ten")));
+        skiplist.insert(k(20, 0), 2, Some(v("twenty")));
+        skiplist.insert(k(30, 0), 3, Some(v("thirty")));
 
         let sstable = SSTable::create_from_skiplist(
             &skiplist,
@@ -701,17 +758,17 @@ mod tests {
         assert_eq!(sstable.entry_count(), 3);
         assert_eq!(sstable.min_key(), &k(10, 0));
         assert_eq!(sstable.max_key(), &k(30, 0));
+        assert_eq!(sstable.max_seq(), 3);
 
-        assert_eq!(sstable.get(&k(10, 0))?.unwrap(), Some(v("ten")));
-        assert_eq!(sstable.get(&k(20, 0))?.unwrap(), Some(v("twenty")));
-        assert_eq!(sstable.get(&k(30, 0))?.unwrap(), Some(v("thirty")));
+        assert_eq!(sstable.get(&k(10, 0))?.unwrap().0, 1);
+        assert_eq!(sstable.get(&k(10, 0))?.unwrap().1, Some(v("ten")));
+        assert_eq!(sstable.get(&k(20, 0))?.unwrap().0, 2);
+        assert_eq!(sstable.get(&k(20, 0))?.unwrap().1, Some(v("twenty")));
+        assert_eq!(sstable.get(&k(30, 0))?.unwrap().1, Some(v("thirty")));
 
         assert_eq!(sstable.get(&k(5, 0))?, None);
         assert_eq!(sstable.get(&k(25, 0))?, None);
         assert_eq!(sstable.get(&k(40, 0))?, None);
-
-        assert_eq!(sstable.get(&k(10, 0))?.unwrap(), Some(v("ten")));
-        assert_eq!(sstable.get(&k(30, 0))?.unwrap(), Some(v("thirty")));
 
         Ok(())
     }
@@ -722,11 +779,11 @@ mod tests {
         let path = dir.path().join("test_scan.sst");
 
         let skiplist = SkipList::new();
-        skiplist.insert(k(10, 0), Some(v("ten")));
-        skiplist.insert(k(20, 0), Some(v("twenty")));
-        skiplist.insert(k(30, 0), Some(v("thirty")));
-        skiplist.insert(k(40, 0), Some(v("forty")));
-        skiplist.insert(k(50, 0), Some(v("fifty")));
+        skiplist.insert(k(10, 0), 1, Some(v("ten")));
+        skiplist.insert(k(20, 0), 2, Some(v("twenty")));
+        skiplist.insert(k(30, 0), 3, Some(v("thirty")));
+        skiplist.insert(k(40, 0), 4, Some(v("forty")));
+        skiplist.insert(k(50, 0), 5, Some(v("fifty")));
 
         let sstable = SSTable::create_from_skiplist(
             &skiplist,
@@ -763,9 +820,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("native.sst");
         let list = SkipList::new();
-        list.insert((vec![1], 100), Some(v("a")));
-        list.insert((vec![1], 200), None);
-        list.insert((vec![2], 100), Some(v("b")));
+        list.insert((vec![1], 100), 1, Some(v("a")));
+        list.insert((vec![1], 200), 2, None);
+        list.insert((vec![2], 100), 3, Some(v("b")));
 
         SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())?;
 
@@ -773,9 +830,28 @@ mod tests {
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
         let mut reader = builder.build()?;
         let batch = reader.next().unwrap().unwrap();
-        assert_eq!(batch.schema().fields().len(), 3);
+        assert_eq!(batch.schema().fields().len(), 5);
         assert_eq!(batch.schema().field(1).data_type(), &DataType::Int64);
         assert!(batch.column(2).is_null(1));
+
+        assert_eq!(batch.schema().field(3).data_type(), &DataType::Int64);
+        assert_eq!(batch.schema().field(4).data_type(), &DataType::Int8);
+        let seq = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(seq.value(0), 1);
+        assert_eq!(seq.value(1), 2);
+        assert_eq!(seq.value(2), 3);
+        let op = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .unwrap();
+        assert_eq!(op.value(0), OP_PUT);
+        assert_eq!(op.value(1), OP_DELETE);
+        assert_eq!(op.value(2), OP_PUT);
 
         Ok(())
     }
@@ -785,19 +861,25 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("1.sst");
         let list = SkipList::new();
-        list.insert((vec![1], 10), Some(v("a")));
-        list.insert((vec![1], 20), None);
+        list.insert((vec![1], 10), 1, Some(v("a")));
+        list.insert((vec![1], 20), 2, None);
         let sst =
             SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())?;
 
-        assert_eq!(sst.get(&(vec![1], 20))?.unwrap(), None);
-        assert_eq!(sst.get(&(vec![1], 10))?.unwrap(), Some(v("a")));
+        assert_eq!(sst.get(&(vec![1], 20))?.unwrap().0, 2);
+        assert_eq!(sst.get(&(vec![1], 20))?.unwrap().1, None);
+        assert_eq!(sst.get(&(vec![1], 10))?.unwrap().1, Some(v("a")));
+        assert_eq!(sst.get(&(vec![9], 99))?, None);
+        assert_eq!(sst.get(&(vec![1], 20))?.unwrap().0, 2);
+        assert_eq!(sst.get(&(vec![1], 20))?.unwrap().1, None);
+        assert_eq!(sst.get(&(vec![1], 10))?.unwrap().1, Some(v("a")));
         assert_eq!(sst.get(&(vec![9], 99))?, None);
 
         let reopened = SSTable::open_from_path(&path, &TableSchema::default_table())?;
         assert_eq!(reopened.min_key(), &(vec![1], 10));
         assert_eq!(reopened.max_key(), &(vec![1], 20));
         assert_eq!(reopened.entry_count(), 2);
+        assert_eq!(reopened.max_seq(), 2);
         Ok(())
     }
 
@@ -806,15 +888,21 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("si.sst");
         let list = SkipList::new();
-        for i in 0..10 {
-            list.insert((vec![i], i as i64), Some(v(&format!("v{}", i))));
+        for i in 0..10u64 {
+            list.insert(
+                (vec![i as u8], i as i64),
+                i + 1,
+                Some(v(&format!("v{}", i))),
+            );
         }
         let sst =
             SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())?;
         let got: Vec<_> = sst.scan_iter(&(vec![3], 3), &(vec![6], 6))?.collect();
         assert_eq!(got.len(), 4);
         assert_eq!(got[0].0, (vec![3], 3));
+        assert_eq!(got[0].1, 4);
         assert_eq!(got[3].0, (vec![6], 6));
+        assert_eq!(got[3].1, 7);
         Ok(())
     }
 
@@ -873,12 +961,20 @@ mod tests {
             cells(b"h1", b"cn", 200, 3, 4),
             cells(b"h2", b"us", 100, 5, 6),
         ];
-        for c in &rows {
-            list.insert(schema.cells_to_key(c), Some(schema.encode_fields(c)));
+        for (i, c) in rows.iter().enumerate() {
+            list.insert(
+                schema.cells_to_key(c),
+                i as u64 + 1,
+                Some(schema.encode_fields(c)),
+            );
         }
         let sst = SSTable::create_from_skiplist(&list, 1, &path, true, &schema)?;
         let k = schema.cells_to_key(&rows[1]);
-        assert_eq!(sst.get(&k)?.unwrap(), Some(schema.encode_fields(&rows[1])));
+        assert_eq!(
+            sst.get(&k)?.unwrap().1,
+            Some(schema.encode_fields(&rows[1]))
+        );
+        assert_eq!(sst.get(&k)?.unwrap().0, 2);
 
         let reopened = SSTable::open_from_path(&path, &schema)?;
         assert_eq!(reopened.entry_count(), 3);
@@ -908,6 +1004,7 @@ mod tests {
                     max_key: k(9, 99),
                 },
             ],
+            max_seq: 99,
         };
         let json = index.to_json()?;
         let decoded = SstableIndex::from_json(&json)?;
@@ -916,6 +1013,7 @@ mod tests {
         assert_eq!(decoded.bloom.seed, index.bloom.seed);
         assert_eq!(decoded.bloom.bits, index.bloom.bits);
         assert_eq!(decoded.row_groups, index.row_groups);
+        assert_eq!(decoded.max_seq, 99);
         for i in 0..100 {
             assert!(decoded.bloom.contains(&k((i % 5) as u8, i)));
         }
@@ -925,7 +1023,7 @@ mod tests {
     #[test]
     fn index_json_rejects_bad_version() {
         let err = SstableIndex::from_json(
-            r#"{"version":999,"bloom":{"m":1024,"k":1,"seed":0,"bits":""},"row_groups":[]}"#,
+            r#"{"version":999,"bloom":{"m":1024,"k":1,"seed":0,"bits":""},"row_groups":[],"max_seq":0}"#,
         );
         assert!(err.is_err());
     }
@@ -933,7 +1031,7 @@ mod tests {
     #[test]
     fn index_json_rejects_bad_base64() {
         let err = SstableIndex::from_json(
-            r#"{"version":1,"bloom":{"m":1024,"k":1,"seed":0,"bits":"!!!not-base64!!!"},"row_groups":[]}"#,
+            r#"{"version":2,"bloom":{"m":1024,"k":1,"seed":0,"bits":"!!!not-base64!!!"},"row_groups":[],"max_seq":0}"#,
         );
         assert!(err.is_err());
     }
@@ -941,8 +1039,9 @@ mod tests {
     #[test]
     fn index_json_rejects_bad_hex() {
         let err = SstableIndex::from_json(
-            r#"{"version":1,"bloom":{"m":1024,"k":1,"seed":0,"bits":"AA=="},
-                "row_groups":[{"num_rows":1,"min_key":{"tag":"zz","ts":0},"max_key":{"tag":"aa","ts":1}}]}"#,
+            r#"{"version":2,"bloom":{"m":1024,"k":1,"seed":0,"bits":"AA=="},
+                "row_groups":[{"num_rows":1,"min_key":{"tag":"zz","ts":0},"max_key":{"tag":"aa","ts":1}}],
+                "max_seq":0}"#,
         );
         assert!(err.is_err());
     }
@@ -953,21 +1052,22 @@ mod tests {
         let path = dir.path().join("1.sst");
         let list = SkipList::new();
         for i in 0..20_000i64 {
-            list.insert((vec![0], i), Some(v(&format!("v{}", i))));
+            list.insert((vec![0], i), i as u64 + 1, Some(v(&format!("v{}", i))));
         }
         let sst =
             SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())?;
         assert_eq!(sst.entry_count(), 20_000);
         assert_eq!(sst.min_key(), &k(0, 0));
         assert_eq!(sst.max_key(), &k(0, 19_999));
+        assert_eq!(sst.max_seq(), 20_000);
 
         for &i in &[0i64, 8191, 8192, 8193, 19_999] {
-            assert_eq!(sst.get(&k(0, i))?.unwrap(), Some(v(&format!("v{}", i))));
+            assert_eq!(sst.get(&k(0, i))?.unwrap().1, Some(v(&format!("v{}", i))));
         }
 
         let reopened = SSTable::open_from_path(&path, &TableSchema::default_table())?;
         assert_eq!(reopened.entry_count(), 20_000);
-        assert_eq!(reopened.get(&k(0, 12_345))?.unwrap(), Some(v("v12345")));
+        assert_eq!(reopened.get(&k(0, 12_345))?.unwrap().1, Some(v("v12345")));
         Ok(())
     }
 
@@ -979,6 +1079,7 @@ mod tests {
         let sst =
             SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())?;
         assert_eq!(sst.entry_count(), 0);
+        assert_eq!(sst.max_seq(), 0);
 
         let reopened = SSTable::open_from_path(&path, &TableSchema::default_table())?;
         assert_eq!(reopened.entry_count(), 0);
@@ -993,7 +1094,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("3.sst");
         let list = SkipList::new();
-        list.insert(k(1, 0), Some(v("a")));
+        list.insert(k(1, 0), 1, Some(v("a")));
         SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())?;
         assert!(path.exists());
         assert!(!dir.path().join("3.sst.tmp").exists());
@@ -1006,7 +1107,7 @@ mod tests {
         let path = dir.path().join("4.sst");
         let list = SkipList::new();
         for i in 0..20_000i64 {
-            list.insert((vec![0], i), Some(v(&format!("v{}", i))));
+            list.insert((vec![0], i), i as u64 + 1, Some(v(&format!("v{}", i))));
         }
         let sst =
             SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())?;
@@ -1025,7 +1126,7 @@ mod tests {
         assert_eq!(full.len(), 20_000);
         let sub: Vec<Key> = full
             .iter()
-            .map(|(k, _)| k.clone())
+            .map(|(k, _, _)| k.clone())
             .filter(|key| key.1 >= 8190 && key.1 <= 8193)
             .collect();
         assert_eq!(sub.len(), 4);

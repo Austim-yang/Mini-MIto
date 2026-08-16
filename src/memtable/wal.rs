@@ -6,16 +6,13 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    memtable::SkipList,
-    types::{Key, Value},
-};
+use crate::types::{Key, Value};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Operation {
-    Insert { key: Key, value: Value },
-    Update { key: Key, value: Value },
-    Delete { key: Key },
+    Insert { key: Key, seq: u64, value: Value },
+    Update { key: Key, seq: u64, value: Value },
+    Delete { key: Key, seq: u64 },
 }
 
 pub struct Wal {
@@ -44,7 +41,7 @@ impl Wal {
         Ok(())
     }
 
-    pub fn recover(&self, skiplist: &SkipList) -> io::Result<()> {
+    pub fn recover(&self, sink: &mut dyn FnMut(&Operation)) -> io::Result<()> {
         let file = File::open(&self.path)?;
         let reader = BufReader::new(file);
         for line in reader.lines() {
@@ -54,14 +51,7 @@ impl Wal {
             }
             let op: Operation = serde_json::from_str(&line)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            match op {
-                Operation::Insert { key, value } | Operation::Update { key, value } => {
-                    skiplist.insert(key, Some(value));
-                }
-                Operation::Delete { key } => {
-                    skiplist.remove(key);
-                }
-            }
+            sink(&op);
         }
         Ok(())
     }
@@ -90,6 +80,17 @@ mod tests {
         s.as_bytes().to_vec()
     }
 
+    fn replay_into(list: &SkipList) -> impl FnMut(&Operation) + '_ {
+        move |op: &Operation| match op {
+            Operation::Insert { key, seq, value } | Operation::Update { key, seq, value } => {
+                list.insert(key.clone(), *seq, Some(value.clone()));
+            }
+            Operation::Delete { key, seq } => {
+                list.insert(key.clone(), *seq, None);
+            }
+        }
+    }
+
     #[test]
     fn test_wal_insert_and_recover() {
         let dir = tempdir().unwrap();
@@ -98,22 +99,24 @@ mod tests {
 
         wal.append(&Operation::Insert {
             key: k(1, 0),
+            seq: 1,
             value: v("one"),
         })
         .unwrap();
         wal.append(&Operation::Insert {
             key: k(2, 0),
+            seq: 2,
             value: v("two"),
         })
         .unwrap();
         wal.close().unwrap();
 
-        let mut list = SkipList::new();
+        let list = SkipList::new();
         let wal_recover = Wal::new(&path).unwrap();
-        wal_recover.recover(&mut list).unwrap();
+        wal_recover.recover(&mut replay_into(&list)).unwrap();
 
-        assert_eq!(list.get(&k(1, 0)), Some(Some(v("one"))));
-        assert_eq!(list.get(&k(2, 0)), Some(Some(v("two"))));
+        assert_eq!(list.get(&k(1, 0)), Some((1, Some(v("one")))));
+        assert_eq!(list.get(&k(2, 0)), Some((2, Some(v("two")))));
         assert_eq!(list.len(), 2);
     }
 
@@ -125,22 +128,28 @@ mod tests {
 
         wal.append(&Operation::Insert {
             key: k(10, 0),
+            seq: 1,
             value: v("old"),
         })
         .unwrap();
         wal.append(&Operation::Update {
             key: k(10, 0),
+            seq: 2,
             value: v("new"),
         })
         .unwrap();
-        wal.append(&Operation::Delete { key: k(10, 0) }).unwrap();
+        wal.append(&Operation::Delete {
+            key: k(10, 0),
+            seq: 3,
+        })
+        .unwrap();
         wal.close().unwrap();
 
-        let mut list = SkipList::new();
+        let list = SkipList::new();
         let wal_recover = Wal::new(&path).unwrap();
-        wal_recover.recover(&mut list).unwrap();
+        wal_recover.recover(&mut replay_into(&list)).unwrap();
 
-        assert_eq!(list.get(&k(10, 0)), Some(None));
+        assert_eq!(list.get(&k(10, 0)), Some((3, None)));
         assert_eq!(list.len(), 1);
     }
 
@@ -150,9 +159,34 @@ mod tests {
         let path = dir.path().join("empty.log");
         Wal::new(&path).unwrap().close().unwrap();
 
-        let mut list = SkipList::new();
+        let list = SkipList::new();
         let wal = Wal::new(&path).unwrap();
-        wal.recover(&mut list).unwrap();
+        wal.recover(&mut replay_into(&list)).unwrap();
         assert_eq!(list.len(), 0);
+    }
+
+    #[test]
+    fn test_wal_roundtrip_preserves_seq() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("seq.log");
+        let mut wal = Wal::new(&path).unwrap();
+        wal.append(&Operation::Insert {
+            key: k(1, 0),
+            seq: 42,
+            value: v("x"),
+        })
+        .unwrap();
+        wal.append(&Operation::Delete {
+            key: k(1, 0),
+            seq: 43,
+        })
+        .unwrap();
+        wal.close().unwrap();
+
+        let list = SkipList::new();
+        let wal_recover = Wal::new(&path).unwrap();
+        wal_recover.recover(&mut replay_into(&list)).unwrap();
+        assert_eq!(list.get(&k(1, 0)), Some((43, None)));
+        assert_eq!(list.max_seq(), 43);
     }
 }

@@ -1,7 +1,7 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use mini_mito::memtable::{SkipList, Wal};
+use mini_mito::memtable::{SkipList, Wal, wal::Operation};
 use tempfile::tempdir;
 
 fn key(i: u64) -> (Vec<u8>, i64) {
@@ -26,6 +26,7 @@ fn bench_wal_append(c: &mut Criterion) {
                     for i in 0..size {
                         let op = mini_mito::memtable::wal::Operation::Insert {
                             key: key(black_box(i)),
+                            seq: i,
                             value: value(black_box(i)),
                         };
                         wal.append(&op).unwrap();
@@ -52,6 +53,7 @@ fn bench_wal_recover(c: &mut Criterion) {
                         for i in 0..size {
                             let op = mini_mito::memtable::wal::Operation::Insert {
                                 key: key(i),
+                                seq: i,
                                 value: value(i),
                             };
                             wal.append(&op).unwrap();
@@ -62,8 +64,17 @@ fn bench_wal_recover(c: &mut Criterion) {
                 },
                 |(path, _dir)| {
                     let wal = Wal::new(&path).unwrap();
-                    let mut list = SkipList::new();
-                    wal.recover(&mut list).unwrap();
+                    let list = SkipList::new();
+                    wal.recover(&mut |op: &Operation| match op {
+                        Operation::Insert { key, seq, value }
+                        | Operation::Update { key, seq, value } => {
+                            list.insert(key.clone(), *seq, Some(value.clone()));
+                        }
+                        Operation::Delete { key, seq } => {
+                            list.insert(key.clone(), *seq, None);
+                        }
+                    })
+                    .unwrap();
                     black_box(list.len());
                 },
                 criterion::BatchSize::SmallInput,

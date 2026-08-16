@@ -20,7 +20,7 @@ fn bench_sstable_create(c: &mut Criterion) {
                 || {
                     let list = SkipList::new();
                     for i in 0..size {
-                        list.insert(key(i), Some(value(i)));
+                        list.insert(key(i), i, Some(value(i)));
                     }
                     (list, tempdir().unwrap())
                 },
@@ -46,7 +46,7 @@ fn bench_sstable_get(c: &mut Criterion) {
     let size = 10_000;
     let list = SkipList::new();
     for i in 0..size {
-        list.insert(key(i), Some(value(i)));
+        list.insert(key(i), i, Some(value(i)));
     }
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.sst");
@@ -72,7 +72,7 @@ fn bench_sstable_scan(c: &mut Criterion) {
     let size = 10_000;
     let list = SkipList::new();
     for i in 0..size {
-        list.insert(key(i), Some(value(i)));
+        list.insert(key(i), i, Some(value(i)));
     }
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.sst");
@@ -98,7 +98,7 @@ fn bench_sstable_get_100k(c: &mut Criterion) {
     let size: u64 = 100_000;
     let list = SkipList::new();
     for i in 0..size {
-        list.insert(key(i), Some(value(i)));
+        list.insert(key(i), i, Some(value(i)));
     }
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.sst");
@@ -124,7 +124,7 @@ fn bench_sstable_scan_100k(c: &mut Criterion) {
     let size: u64 = 100_000;
     let list = SkipList::new();
     for i in 0..size {
-        list.insert(key(i), Some(value(i)));
+        list.insert(key(i), i, Some(value(i)));
     }
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.sst");
