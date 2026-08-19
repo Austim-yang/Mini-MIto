@@ -14,6 +14,7 @@ use crate::{
     memtable::{
         SkipList, Wal,
         traits::{ImmutableMemtable, Memtable},
+        version::Version,
         wal::Operation,
     },
     schema::TableSchema,
@@ -213,16 +214,16 @@ impl ImmutableMemtable for ImmutableSkipListMemtable {
 }
 
 pub struct Region {
-    active: Arc<RwLock<Option<Box<dyn Memtable>>>>,
-    immutables: Arc<RwLock<Vec<Box<dyn ImmutableMemtable>>>>,
+    version: Arc<Mutex<Arc<Version>>>,
     sst_id: AtomicUsize,
     seq: AtomicU64,
     base_dir: PathBuf,
     max_memory_bytes: usize,
     flush_threshold: usize,
     manifest_path: PathBuf,
-    immutable_ssts: Arc<RwLock<Vec<SSTable>>>,
     schema: Arc<TableSchema>,
+    write_gate: Arc<RwLock<()>>,
+    flush_lock: Mutex<()>,
 }
 
 impl Region {
@@ -237,47 +238,31 @@ impl Region {
             .unwrap_or(Path::new("."))
             .to_path_buf();
         let manifest_path = base_dir.join("manifest");
-        let initial_wal = base_dir.join("wal_000.log");
-        let active_mem = MutableSkipListMemtable::new(initial_wal)?;
         let mut region = Self {
-            active: Arc::new(RwLock::new(Some(Box::new(active_mem)))),
-            immutables: Arc::new(RwLock::new(Vec::new())),
+            version: Arc::new(Mutex::new(Arc::new(Version::new(
+                Arc::from(
+                    Box::new(MutableSkipListMemtable::new(base_dir.join("wal_000.log"))?)
+                        as Box<dyn Memtable>,
+                ),
+                Vec::new(),
+                0,
+            )))),
             sst_id: AtomicUsize::new(0),
             seq: AtomicU64::new(0),
             base_dir: base_dir.clone(),
             max_memory_bytes: 1024 * 1024 * 10,
             flush_threshold: 1000,
             manifest_path: manifest_path.clone(),
-            immutable_ssts: Arc::new(RwLock::new(Vec::new())),
             schema,
+            write_gate: Arc::new(RwLock::new(())),
+            flush_lock: Mutex::new(()),
         };
-        region.load_manifest()?;
-        region.recover()?;
-        region.reset_seq_watermark()?;
-        Ok(region)
-    }
+        let mut ssts: Vec<SSTable> = Vec::new();
+        region.load_manifest(&mut ssts)?;
+        let found = region.scan_sst_files(&mut ssts)?;
+        ssts.sort_by_key(|s| s.id());
 
-    fn reset_seq_watermark(&self) -> io::Result<()> {
-        let mut watermark = 0u64;
-        if let Some(active) = self.active.read().unwrap().as_ref() {
-            watermark = watermark.max(active.max_seq());
-        }
-        for imm in self.immutables.read().unwrap().iter() {
-            watermark = watermark.max(imm.max_seq());
-        }
-        for sst in self.immutable_ssts.read().unwrap().iter() {
-            watermark = watermark.max(sst.max_seq());
-        }
-        self.seq.store(watermark + 1, Ordering::SeqCst);
-        Ok(())
-    }
-
-    pub fn schema(&self) -> Arc<TableSchema> {
-        self.schema.clone()
-    }
-
-    fn recover(&mut self) -> io::Result<()> {
-        let mut wal_files: Vec<PathBuf> = fs::read_dir(&self.base_dir)?
+        let mut wal_files: Vec<PathBuf> = fs::read_dir(&region.base_dir)?
             .filter_map(|e| e.ok())
             .filter(|e| {
                 let name = e.file_name();
@@ -289,29 +274,41 @@ impl Region {
             .collect();
         wal_files.sort();
 
-        if wal_files.is_empty() {
-            let new_wal = self.base_dir.join("wal_000.log");
-            let active = MutableSkipListMemtable::new(new_wal)?;
-            *self.active.write().unwrap() = Some(Box::new(active));
-            return Ok(());
+        let active: Arc<dyn Memtable> = match wal_files.pop() {
+            Some(last_wal) => {
+                Arc::from(Box::new(MutableSkipListMemtable::new(last_wal)?) as Box<dyn Memtable>)
+            }
+            None => region.version.lock().unwrap().active.clone(),
+        };
+        region.merge_orphan_wals(&wal_files, active.as_ref())?;
+
+        let watermark = {
+            let mut w = 0u64;
+            w = w.max(active.max_seq());
+            for sst in ssts.iter() {
+                w = w.max(sst.max_seq());
+            }
+            w
+        };
+        region.seq.store(watermark + 1, Ordering::SeqCst);
+
+        region.swap_version(Version::new(active, ssts, watermark));
+
+        if !region.manifest_path.exists() || found > 0 {
+            region.write_manifest()?;
         }
-
-        let last_wal = wal_files.pop().unwrap();
-        let found = self.scan_sst_files()?;
-
-        let active = MutableSkipListMemtable::new(last_wal)?;
-        *self.active.write().unwrap() = Some(Box::new(active));
-
-        self.merge_orphan_wals(&wal_files)?;
-        if !self.manifest_path.exists() || found > 0 {
-            self.write_manifest()?;
-        }
-        Ok(())
+        Ok(region)
     }
 
-    fn merge_orphan_wals(&self, wal_files: &[PathBuf]) -> io::Result<()> {
-        let active_guard = self.active.read().unwrap();
-        let active = active_guard.as_ref().unwrap();
+    fn swap_version(&self, v: Version) {
+        *self.version.lock().unwrap() = Arc::new(v);
+    }
+
+    pub fn schema(&self) -> Arc<TableSchema> {
+        self.schema.clone()
+    }
+
+    fn merge_orphan_wals(&self, wal_files: &[PathBuf], active: &dyn Memtable) -> io::Result<()> {
         for path in wal_files {
             let wal = Wal::new(path)?;
             let skiplist = SkipList::new();
@@ -340,7 +337,7 @@ impl Region {
         Ok(())
     }
 
-    fn scan_sst_files(&mut self) -> io::Result<usize> {
+    fn scan_sst_files(&mut self, ssts: &mut Vec<SSTable>) -> io::Result<usize> {
         let mut files: Vec<PathBuf> = fs::read_dir(&self.base_dir)?
             .filter_map(|e| e.ok())
             .filter(|e| {
@@ -352,7 +349,6 @@ impl Region {
             .map(|e| e.path())
             .collect();
 
-        let mut ssts = self.immutable_ssts.write().unwrap();
         let existing: Vec<PathBuf> = ssts.iter().map(|s| s.path().clone()).collect();
 
         files.sort_by_key(|p| {
@@ -387,7 +383,7 @@ impl Region {
         Ok(added)
     }
 
-    fn load_manifest(&mut self) -> io::Result<()> {
+    fn load_manifest(&mut self, ssts: &mut Vec<SSTable>) -> io::Result<()> {
         if !self.manifest_path.exists() {
             return Ok(());
         }
@@ -404,7 +400,6 @@ impl Region {
             entries.push(entry);
         }
         entries.sort_by_key(|e| e.id);
-        let mut ssts = self.immutable_ssts.write().unwrap();
         for entry in entries {
             let path = self.base_dir.join(&entry.path);
             if path.exists() {
@@ -432,7 +427,7 @@ impl Region {
         let tmp_path = self.manifest_path.with_extension("tmp");
         let file = fs::File::create(&tmp_path)?;
         let mut writer = io::BufWriter::new(file);
-        let ssts = self.immutable_ssts.read().unwrap();
+        let ssts = &self.version.lock().unwrap().clone().ssts;
         for sst in ssts.iter() {
             let entry = super::memtable::ManifestEntry {
                 id: sst.id(),
@@ -474,9 +469,9 @@ impl Region {
             .map(|(i, (key, value))| (key, start + i as u64, value))
             .collect();
         {
-            let active_opt = self.active.read().unwrap();
-            let active = active_opt.as_ref().unwrap();
-            active.write_batch(entries)?;
+            let _gate = self.write_gate.read().unwrap();
+            let v = self.version.lock().unwrap().clone();
+            v.active.write_batch(entries)?;
         }
         self.maybe_flush()?;
         Ok(())
@@ -485,23 +480,22 @@ impl Region {
     fn write_inner(&self, key: Key, value: Option<Value>) -> io::Result<Option<Value>> {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst);
         let result = {
-            let active_opt = self.active.read().unwrap();
-            let active = active_opt.as_ref().unwrap();
-            active.write(key, seq, value)?
+            let _gate = self.write_gate.read().unwrap();
+            let v = self.version.lock().unwrap().clone();
+            v.active.write(key, seq, value)?
         };
         self.maybe_flush()?;
         Ok(result)
     }
 
     fn maybe_flush(&self) -> io::Result<()> {
-        let active_len = self
-            .active
-            .read()
-            .unwrap()
-            .as_ref()
-            .map(|a| a.len())
-            .unwrap_or(0);
-        let total = self.estimated_total_memory();
+        let v = self.version.lock().unwrap().clone();
+        let active_len = v.active.len();
+        let total = v.active.estimated_size()
+            + v.immutables
+                .iter()
+                .map(|i| i.estimated_size())
+                .sum::<usize>();
         if total > self.max_memory_bytes || active_len >= self.flush_threshold {
             self.schedule_flush()?;
         }
@@ -517,16 +511,16 @@ impl Region {
     }
 
     pub fn get(&self, key: Key) -> io::Result<Option<Value>> {
+        let v = self.version.lock().unwrap().clone();
         let mut best: Option<(u64, Option<Value>)> = None;
 
-        if let Some(active) = self.active.read().unwrap().as_ref()
-            && active.max_seq() > best.as_ref().map(|(s, _)| *s).unwrap_or(0)
-            && let Some(e) = active.get(&key)?
+        if v.active.max_seq() > best.as_ref().map(|(s, _)| *s).unwrap_or(0)
+            && let Some(e) = v.active.get(&key)?
         {
             best = Some(e);
         }
 
-        for imm in self.immutables.read().unwrap().iter().rev() {
+        for imm in v.immutables.iter().rev() {
             if imm.max_seq() > best.as_ref().map(|(s, _)| *s).unwrap_or(0)
                 && let Some(e) = imm.get(&key)?
             {
@@ -534,7 +528,7 @@ impl Region {
             }
         }
 
-        for sst in self.immutable_ssts.read().unwrap().iter().rev() {
+        for sst in v.ssts.iter().rev() {
             if sst.max_seq() > best.as_ref().map(|(s, _)| *s).unwrap_or(0)
                 && let Some(e) = sst.get(&key)?
             {
@@ -551,88 +545,77 @@ impl Region {
     }
 
     fn schedule_flush(&self) -> io::Result<()> {
-        let (imm, wal_path) = {
-            let mut active_lock = self.active.write().unwrap();
-            let old_active = match active_lock.take() {
-                Some(a) => a,
-                None => return Ok(()),
-            };
-            if old_active.len() == 0 {
-                *active_lock = Some(old_active);
+        let _flush = self.flush_lock.lock().unwrap();
+        {
+            let _gate = self.write_gate.write().unwrap();
+            let v = self.version.lock().unwrap().clone();
+            if v.active.len() == 0 {
                 return Ok(());
             }
-            let new_active = match old_active.fork() {
-                Ok(a) => a,
-                Err(e) => {
-                    *active_lock = Some(old_active);
-                    return Err(e);
-                }
-            };
-
-            let imm = match old_active.freeze() {
-                Ok(i) => i,
-                Err(e) => {
-                    *active_lock = Some(old_active);
-                    return Err(e);
-                }
-            };
-            *active_lock = Some(new_active);
-            let wal_path = imm.wal_path().to_path_buf();
-            (imm, wal_path)
-        };
-
-        self.immutables.write().unwrap().push(imm);
+            let new_active: Arc<dyn Memtable> = Arc::from(v.active.fork()?);
+            let imm: Arc<dyn ImmutableMemtable> = Arc::from(v.active.freeze()?);
+            self.swap_version(v.with_frozen(new_active, imm));
+        }
         self.flush_immutables()?;
-        let _ = fs::remove_file(wal_path);
         Ok(())
     }
 
     fn flush_immutables(&self) -> io::Result<()> {
-        let mut immutables = self.immutables.write().unwrap();
+        let v = self.version.lock().unwrap().clone();
+        if v.immutables.is_empty() {
+            return Ok(());
+        }
         let mut new_ssts = Vec::new();
-        let mut ids_to_remove = Vec::new();
-        for (i, imm) in immutables.iter().enumerate() {
+        let mut flushed_wals: Vec<PathBuf> = Vec::new();
+        for imm in v.immutables.iter() {
             let id = self.sst_id.load(Ordering::SeqCst);
             let path = self.base_dir.join(format!("{:04}.sst", id));
             let sst = imm.to_sstable(id, &path, &self.schema)?;
-            new_ssts.push(sst);
-            ids_to_remove.push(i);
             self.sst_id.fetch_add(1, Ordering::SeqCst);
+            new_ssts.push(sst);
+            flushed_wals.push(imm.wal_path().to_path_buf());
         }
-        for i in ids_to_remove.into_iter().rev() {
-            immutables.remove(i);
-        }
-        {
-            let mut ssts = self.immutable_ssts.write().unwrap();
-            ssts.extend(new_ssts);
-        }
+        let mut ssts = v.ssts.clone();
+        ssts.extend(new_ssts);
+        ssts.sort_by_key(|s| s.id());
+        self.swap_version(Version {
+            active: v.active.clone(),
+            immutables: Vec::new(),
+            ssts,
+            seq: v.seq,
+        });
         self.write_manifest()?;
+        for p in flushed_wals {
+            let _ = fs::remove_file(p);
+        }
         Ok(())
     }
 
     pub fn compact(&self) -> io::Result<()> {
-        let ssts = self.immutable_ssts.read().unwrap();
-        if ssts.len() < 4 {
+        let _flush = self.flush_lock.lock().unwrap();
+        let v = self.version.lock().unwrap().clone();
+        if v.ssts.len() < 4 {
             return Ok(());
         }
-        let old_paths: Vec<PathBuf> = ssts.iter().map(|s| s.path().clone()).collect();
+        let old_paths: Vec<PathBuf> = v.ssts.iter().map(|s| s.path().clone()).collect();
         let merged_skiplist = SkipList::new();
-        for sst in ssts.iter() {
+        for sst in v.ssts.iter() {
             let rows = sst.scan(sst.min_key(), sst.max_key())?;
             for (k, seq, v) in rows {
                 merged_skiplist.insert(k, seq, v);
             }
         }
-        drop(ssts);
         let id = self.sst_id.load(Ordering::SeqCst);
         let path = self.base_dir.join(format!("{:04}.sst", id));
         let new_sst =
             SSTable::create_from_skiplist(&merged_skiplist, id, &path, true, &self.schema)?;
-        {
-            let mut ssts_w = self.immutable_ssts.write().unwrap();
-            *ssts_w = vec![new_sst];
-            self.sst_id.fetch_add(1, Ordering::SeqCst);
-        }
+        self.sst_id.fetch_add(1, Ordering::SeqCst);
+        self.swap_version(Version {
+            active: v.active.clone(),
+            immutables: v.immutables.clone(),
+            ssts: vec![new_sst],
+            seq: v.seq,
+        });
         self.write_manifest()?;
         for p in old_paths {
             let _ = fs::remove_file(p);
@@ -641,56 +624,30 @@ impl Region {
     }
 
     pub fn len(&self) -> usize {
-        let active_len = self
-            .active
-            .read()
-            .unwrap()
-            .as_ref()
-            .map(|a| a.len())
-            .unwrap_or(0);
-        let imm_len: usize = self
-            .immutables
-            .read()
-            .unwrap()
-            .iter()
-            .map(|i| i.len())
-            .sum();
-        let sst_len: usize = self
-            .immutable_ssts
-            .read()
-            .unwrap()
-            .iter()
-            .map(|s| s.entry_count())
-            .sum();
-        active_len + imm_len + sst_len
+        let v = self.version.lock().unwrap().clone();
+        let imm_len: usize = v.immutables.iter().map(|i| i.len()).sum();
+        let sst_len: usize = v.ssts.iter().map(|s| s.entry_count()).sum();
+        v.active.len() + imm_len + sst_len
     }
 
     pub fn estimated_total_memory(&self) -> usize {
-        let active = self
-            .active
-            .read()
-            .unwrap()
-            .as_ref()
-            .map(|a| a.estimated_size())
-            .unwrap_or(0);
-        let imm: usize = self
-            .immutables
-            .read()
-            .unwrap()
-            .iter()
-            .map(|i| i.estimated_size())
-            .sum();
-        active + imm
+        let v = self.version.lock().unwrap().clone();
+        v.active.estimated_size()
+            + v.immutables
+                .iter()
+                .map(|i| i.estimated_size())
+                .sum::<usize>()
     }
 
     pub fn get_immutable_ssts(&self) -> Vec<SSTable> {
-        self.immutable_ssts.read().unwrap().clone()
+        self.version.lock().unwrap().clone().ssts.clone()
     }
 
     pub fn iter_all_data(&self) -> io::Result<impl Iterator<Item = (Key, Option<Value>)> + '_> {
         use std::collections::BTreeMap;
+        let v = self.version.lock().unwrap().clone();
         let mut map: BTreeMap<Key, (u64, Option<Value>)> = BTreeMap::new();
-        for sst in self.immutable_ssts.read().unwrap().iter().rev() {
+        for sst in v.ssts.iter().rev() {
             for (k, seq, v) in sst.scan(sst.min_key(), sst.max_key())? {
                 map.entry(k)
                     .and_modify(|(s, cur)| {
@@ -702,7 +659,7 @@ impl Region {
                     .or_insert((seq, v));
             }
         }
-        for imm in self.immutables.read().unwrap().iter().rev() {
+        for imm in v.immutables.iter().rev() {
             for (k, seq, v) in imm.iter() {
                 map.entry(k)
                     .and_modify(|(s, cur)| {
@@ -714,64 +671,42 @@ impl Region {
                     .or_insert((seq, v));
             }
         }
-        if let Some(active) = self.active.read().unwrap().as_ref() {
-            for (k, seq, v) in active.iter() {
-                map.entry(k)
-                    .and_modify(|(s, cur)| {
-                        if seq > *s {
-                            *s = seq;
-                            *cur = v.clone();
-                        }
-                    })
-                    .or_insert((seq, v));
-            }
+        for (k, seq, v) in v.active.iter() {
+            map.entry(k)
+                .and_modify(|(s, cur)| {
+                    if seq > *s {
+                        *s = seq;
+                        *cur = v.clone();
+                    }
+                })
+                .or_insert((seq, v));
         }
-        Ok(map.into_iter().map(|(k, (_, v))| (k, v)))
+        Ok(map.into_iter().map(|(k, (_, value))| (k, value)))
     }
 
     pub fn snapshot_sources(
         &self,
     ) -> io::Result<Vec<Box<dyn Iterator<Item = (Key, u64, Option<Value>)>>>> {
-        let mut out: Vec<Box<dyn Iterator<Item = (Key, u64, Option<Value>)>>> = Vec::new();
-        if let Some(active) = self.active.read().unwrap().as_ref()
-            && active.len() > 0
-        {
-            out.push(Box::new(active.iter().collect::<Vec<_>>().into_iter()));
-        }
-
-        for imm in self.immutables.read().unwrap().iter().rev() {
-            if imm.len() > 0 {
-                out.push(Box::new(imm.iter().collect::<Vec<_>>().into_iter()));
-            }
-        }
-        for sst in self.immutable_ssts.read().unwrap().iter().rev() {
-            let iter = sst.scan_iter(sst.min_key(), sst.max_key())?;
-            out.push(Box::new(iter));
-        }
-        Ok(out)
+        self.version.lock().unwrap().clone().sources()
     }
 
     pub fn close(&self) -> io::Result<()> {
-        if let Some(active) = self.active.read().unwrap().as_ref() {
-            active.close()?;
-        }
-        Ok(())
+        let v = self.version.lock().unwrap().clone();
+        v.active.close()
     }
 }
 
 impl std::fmt::Debug for Region {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let v = self.version.lock().unwrap().clone();
         f.debug_struct("Region")
             .field("sst_id", &self.sst_id.load(Ordering::SeqCst))
             .field("seq", &self.seq.load(Ordering::SeqCst))
             .field("base_dir", &self.base_dir)
             .field("max_memory_bytes", &self.max_memory_bytes)
             .field("flush_threshold", &self.flush_threshold)
-            .field(
-                "immutable_ssts_count",
-                &self.immutable_ssts.read().unwrap().len(),
-            )
-            .field("immutables_count", &self.immutables.read().unwrap().len())
+            .field("ssts_count", &v.ssts.len())
+            .field("immutables_count", &v.immutables.len())
             .finish()
     }
 }
@@ -1117,5 +1052,141 @@ mod tests {
             assert_eq!(region.get(k(3, 0))?, Some(v("c")));
             Ok(())
         }
+    }
+
+    #[test]
+    fn test_region_reader_never_sees_partial_batch_during_flush() -> io::Result<()> {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal.log");
+        let region = Arc::new(Region::new(&wal_path)?);
+
+        let writer = {
+            let region = region.clone();
+            std::thread::spawn(move || -> io::Result<()> {
+                for b in 0u8..40 {
+                    for i in 0..64u64 {
+                        region.write(k(b, i as i64), format!("b{}i{}", b, i).into_bytes())?;
+                    }
+                    region.write(k(0xFF, b as i64), vec![b])?;
+                }
+                Ok(())
+            })
+        };
+        let reader = {
+            let region = region.clone();
+            std::thread::spawn(move || -> io::Result<()> {
+                for _ in 0..400 {
+                    for b in 0u8..40 {
+                        if let Some(marker) = region.get(k(0xFF, b as i64))? {
+                            let mb = marker[0];
+                            for i in 0..64u64 {
+                                let expect = format!("b{}i{}", mb, i).into_bytes();
+                                if region.get(k(mb, i as i64))? != Some(expect) {
+                                    return Err(io::Error::other("reader saw partial batch"));
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            })
+        };
+        let flusher = {
+            let region = region.clone();
+            std::thread::spawn(move || -> io::Result<()> {
+                for _ in 0..300 {
+                    region.flush()?;
+                }
+                Ok(())
+            })
+        };
+
+        writer.join().unwrap()?;
+        flusher.join().unwrap()?;
+        reader.join().unwrap()?;
+
+        for b in 0u8..40 {
+            for i in 0..64u64 {
+                assert_eq!(
+                    region.get(k(b, i as i64))?,
+                    Some(format!("b{}i{}", b, i).into_bytes())
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_region_snapshot_consistent_during_flush() -> io::Result<()> {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal.log");
+        let region = Arc::new(Region::new(&wal_path)?);
+        for i in 0..5000u64 {
+            region.write(
+                k((i % 250) as u8, (i / 250) as i64),
+                i.to_le_bytes().to_vec(),
+            )?;
+        }
+
+        let snapshot = region.snapshot_sources()?;
+        let flusher = {
+            let region = region.clone();
+            std::thread::spawn(move || {
+                for _ in 0..10 {
+                    region.flush().unwrap();
+                }
+            })
+        };
+
+        let mut seen = std::collections::HashSet::new();
+        for src in snapshot {
+            for (key, _, _) in src {
+                seen.insert(key);
+            }
+        }
+        flusher.join().unwrap();
+
+        assert_eq!(seen.len(), 5000);
+        for i in 0..5000u64 {
+            assert_eq!(
+                region.get(k((i % 250) as u8, (i / 250) as i64))?,
+                Some(i.to_le_bytes().to_vec())
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_region_concurrent_flush_reopen_no_loss() -> io::Result<()> {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal.log");
+        {
+            let region = Arc::new(Region::new(&wal_path)?);
+            let mut handles = Vec::new();
+            for t in 0..4u64 {
+                let region = region.clone();
+                handles.push(std::thread::spawn(move || -> io::Result<()> {
+                    for i in 0..250u64 {
+                        region.write(k(t as u8, i as i64), i.to_le_bytes().to_vec())?;
+                    }
+                    Ok(())
+                }));
+            }
+            for h in handles {
+                h.join().unwrap()?;
+            }
+            region.flush()?;
+            region.close()?;
+        }
+        let region = Region::new(&wal_path)?;
+        for t in 0..4u64 {
+            for i in 0..250u64 {
+                assert_eq!(
+                    region.get(k(t as u8, i as i64))?,
+                    Some(i.to_le_bytes().to_vec())
+                );
+            }
+        }
+        Ok(())
     }
 }
