@@ -1,9 +1,9 @@
-pub mod skiptable;
-pub mod wal;
 pub mod memtable;
+pub mod skiptable;
 pub mod traits;
+pub mod wal;
 
+pub use memtable::Region;
 pub use skiptable::SkipList;
+pub use traits::{ImmutableMemtable, Memtable};
 pub use wal::Wal;
-pub use memtable::MemtableManager;
-pub use traits::{Memtable, ImmutableMemtable};

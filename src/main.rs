@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use datafusion::execution::context::SessionContext;
-use mini_mito::{Key, LSMTableProvider, MemtableManager, Value};
+use mini_mito::{Key, LSMTableProvider, Region, Value};
 use tempfile::tempdir;
 
 fn k(tag: u8, ts: i64) -> Key {
@@ -16,18 +16,18 @@ async fn main() -> datafusion::error::Result<()> {
     let dir = tempdir().expect("创建临时目录失败");
     let wal_path = dir.path().join("wal.log");
 
-    let memtable_manager = MemtableManager::new(&wal_path).expect("打开 Memtable 失败");
+    let region = Region::new(&wal_path).expect("打开 Memtable 失败");
 
-    memtable_manager.write(k(1, 1000), v("value1"))?;
-    memtable_manager.write(k(2, 2000), v("value2"))?;
-    memtable_manager.write(k(1, 3000), v("value3"))?;
+    region.write(k(1, 1000), v("value1"))?;
+    region.write(k(2, 2000), v("value2"))?;
+    region.write(k(1, 3000), v("value3"))?;
 
-    memtable_manager.flush()?;
+    region.flush()?;
 
-    memtable_manager.write(k(3, 4000), v("value4"))?;
-    memtable_manager.write(k(2, 5000), v("value5"))?;
+    region.write(k(3, 4000), v("value4"))?;
+    region.write(k(2, 5000), v("value5"))?;
 
-    let provider = LSMTableProvider::new(memtable_manager);
+    let provider = LSMTableProvider::new(region);
     let ctx = SessionContext::new();
     ctx.register_table("my_table", Arc::new(provider))?;
 

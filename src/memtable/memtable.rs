@@ -212,7 +212,7 @@ impl ImmutableMemtable for ImmutableSkipListMemtable {
     }
 }
 
-pub struct MemtableManager {
+pub struct Region {
     active: Arc<RwLock<Option<Box<dyn Memtable>>>>,
     immutables: Arc<RwLock<Vec<Box<dyn ImmutableMemtable>>>>,
     sst_id: AtomicUsize,
@@ -225,7 +225,7 @@ pub struct MemtableManager {
     schema: Arc<TableSchema>,
 }
 
-impl MemtableManager {
+impl Region {
     pub fn new<P: AsRef<Path>>(wal_path: P) -> io::Result<Self> {
         Self::with_schema(wal_path, Arc::new(TableSchema::default_table()))
     }
@@ -239,7 +239,7 @@ impl MemtableManager {
         let manifest_path = base_dir.join("manifest");
         let initial_wal = base_dir.join("wal_000.log");
         let active_mem = MutableSkipListMemtable::new(initial_wal)?;
-        let mut mgr = Self {
+        let mut region = Self {
             active: Arc::new(RwLock::new(Some(Box::new(active_mem)))),
             immutables: Arc::new(RwLock::new(Vec::new())),
             sst_id: AtomicUsize::new(0),
@@ -251,10 +251,10 @@ impl MemtableManager {
             immutable_ssts: Arc::new(RwLock::new(Vec::new())),
             schema,
         };
-        mgr.load_manifest()?;
-        mgr.recover()?;
-        mgr.reset_seq_watermark()?;
-        Ok(mgr)
+        region.load_manifest()?;
+        region.recover()?;
+        region.reset_seq_watermark()?;
+        Ok(region)
     }
 
     fn reset_seq_watermark(&self) -> io::Result<()> {
@@ -759,9 +759,9 @@ impl MemtableManager {
     }
 }
 
-impl std::fmt::Debug for MemtableManager {
+impl std::fmt::Debug for Region {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MemtableManager")
+        f.debug_struct("Region")
             .field("sst_id", &self.sst_id.load(Ordering::SeqCst))
             .field("seq", &self.seq.load(Ordering::SeqCst))
             .field("base_dir", &self.base_dir)
@@ -796,25 +796,25 @@ mod tests {
     fn test_memtable_insert_get_remove() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.log");
-        let mgr = MemtableManager::new(&path).unwrap();
-        assert_eq!(mgr.len(), 0);
+        let region = Region::new(&path).unwrap();
+        assert_eq!(region.len(), 0);
 
-        assert_eq!(mgr.write(k(1, 0), v("one")).unwrap(), None);
-        assert_eq!(mgr.write(k(2, 0), v("two")).unwrap(), None);
-        assert_eq!(mgr.len(), 2);
+        assert_eq!(region.write(k(1, 0), v("one")).unwrap(), None);
+        assert_eq!(region.write(k(2, 0), v("two")).unwrap(), None);
+        assert_eq!(region.len(), 2);
 
-        assert_eq!(mgr.get(k(1, 0)).unwrap(), Some(v("one")));
-        assert_eq!(mgr.get(k(3, 0)).unwrap(), None);
+        assert_eq!(region.get(k(1, 0)).unwrap(), Some(v("one")));
+        assert_eq!(region.get(k(3, 0)).unwrap(), None);
 
-        assert_eq!(mgr.write(k(1, 0), v("uno")).unwrap(), Some(v("one")));
-        assert_eq!(mgr.get(k(1, 0)).unwrap(), Some(v("uno")));
+        assert_eq!(region.write(k(1, 0), v("uno")).unwrap(), Some(v("one")));
+        assert_eq!(region.get(k(1, 0)).unwrap(), Some(v("uno")));
 
-        assert_eq!(mgr.delete(k(2, 0)).unwrap(), Some(v("two")));
-        assert_eq!(mgr.len(), 2);
-        assert_eq!(mgr.get(k(2, 0)).unwrap(), None);
-        assert_eq!(mgr.delete(k(3, 0)).unwrap(), None);
+        assert_eq!(region.delete(k(2, 0)).unwrap(), Some(v("two")));
+        assert_eq!(region.len(), 2);
+        assert_eq!(region.get(k(2, 0)).unwrap(), None);
+        assert_eq!(region.delete(k(3, 0)).unwrap(), None);
 
-        mgr.close().unwrap();
+        region.close().unwrap();
     }
 
     #[test]
@@ -823,17 +823,17 @@ mod tests {
         let path = dir.path().join("test.log");
 
         {
-            let mgr = MemtableManager::new(&path).unwrap();
-            mgr.write(k(1, 0), v("one")).unwrap();
-            mgr.write(k(2, 0), v("two")).unwrap();
-            mgr.close().unwrap();
+            let region = Region::new(&path).unwrap();
+            region.write(k(1, 0), v("one")).unwrap();
+            region.write(k(2, 0), v("two")).unwrap();
+            region.close().unwrap();
         }
 
         {
-            let mgr = MemtableManager::new(&path).unwrap();
-            assert_eq!(mgr.len(), 2);
-            assert_eq!(mgr.get(k(1, 0)).unwrap(), Some(v("one")));
-            assert_eq!(mgr.get(k(2, 0)).unwrap(), Some(v("two")));
+            let region = Region::new(&path).unwrap();
+            assert_eq!(region.len(), 2);
+            assert_eq!(region.get(k(1, 0)).unwrap(), Some(v("one")));
+            assert_eq!(region.get(k(2, 0)).unwrap(), Some(v("two")));
         }
     }
 
@@ -843,14 +843,14 @@ mod tests {
         let path = dir.path().join("empty.log");
 
         {
-            let mgr = MemtableManager::new(&path).unwrap();
-            assert_eq!(mgr.len(), 0);
-            mgr.close().unwrap();
+            let region = Region::new(&path).unwrap();
+            assert_eq!(region.len(), 0);
+            region.close().unwrap();
         }
 
         {
-            let mgr = MemtableManager::new(&path).unwrap();
-            assert_eq!(mgr.len(), 0);
+            let region = Region::new(&path).unwrap();
+            assert_eq!(region.len(), 0);
         }
     }
 
@@ -858,32 +858,32 @@ mod tests {
     fn test_memtable_flush() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.log");
-        let mgr = MemtableManager::new(&path).unwrap();
-        mgr.write(k(1, 0), v("one")).unwrap();
-        mgr.flush().unwrap();
-        mgr.close().unwrap();
+        let region = Region::new(&path).unwrap();
+        region.write(k(1, 0), v("one")).unwrap();
+        region.flush().unwrap();
+        region.close().unwrap();
 
-        let mgr2 = MemtableManager::new(&path).unwrap();
-        assert_eq!(mgr2.get(k(1, 0)).unwrap(), Some(v("one")));
+        let region2 = Region::new(&path).unwrap();
+        assert_eq!(region2.get(k(1, 0)).unwrap(), Some(v("one")));
     }
 
     #[test]
     fn test_memtable_flush_multiple() -> io::Result<()> {
         let dir = tempdir().unwrap();
         let wal_path = dir.path().join("wal.log");
-        let mut mgr = MemtableManager::new(&wal_path)?;
-        mgr.set_flush_threshold(2);
+        let mut region = Region::new(&wal_path)?;
+        region.set_flush_threshold(2);
 
-        mgr.write(k(1, 0), v("a"))?;
-        mgr.write(k(2, 0), v("b"))?;
-        assert_eq!(mgr.get_immutable_ssts().len(), 1);
+        region.write(k(1, 0), v("a"))?;
+        region.write(k(2, 0), v("b"))?;
+        assert_eq!(region.get_immutable_ssts().len(), 1);
 
-        mgr.write(k(3, 0), v("c"))?;
-        mgr.write(k(4, 0), v("d"))?;
-        assert_eq!(mgr.get_immutable_ssts().len(), 2);
+        region.write(k(3, 0), v("c"))?;
+        region.write(k(4, 0), v("d"))?;
+        assert_eq!(region.get_immutable_ssts().len(), 2);
 
-        assert_eq!(mgr.get(k(1, 0))?, Some(v("a")));
-        assert_eq!(mgr.get(k(4, 0))?, Some(v("d")));
+        assert_eq!(region.get(k(1, 0))?, Some(v("a")));
+        assert_eq!(region.get(k(4, 0))?, Some(v("d")));
         Ok(())
     }
 
@@ -894,38 +894,38 @@ mod tests {
         let manifest_path = dir.path().join("manifest");
 
         {
-            let mut mgr = MemtableManager::new(&wal_path)?;
-            mgr.set_flush_threshold(2);
+            let mut region = Region::new(&wal_path)?;
+            region.set_flush_threshold(2);
 
-            mgr.write(k(1, 0), v("a"))?;
-            mgr.write(k(2, 0), v("b"))?;
-            mgr.write(k(3, 0), v("c"))?;
-            mgr.write(k(4, 0), v("d"))?;
+            region.write(k(1, 0), v("a"))?;
+            region.write(k(2, 0), v("b"))?;
+            region.write(k(3, 0), v("c"))?;
+            region.write(k(4, 0), v("d"))?;
 
-            mgr.flush()?;
-            assert!(mgr.get_immutable_ssts().len() >= 2);
+            region.flush()?;
+            assert!(region.get_immutable_ssts().len() >= 2);
             assert!(manifest_path.exists());
-            mgr.close()?;
+            region.close()?;
         }
 
         fs::remove_file(&manifest_path)?;
         assert!(!manifest_path.exists());
 
         {
-            let mgr = MemtableManager::new(&wal_path)?;
-            assert!(mgr.get_immutable_ssts().len() >= 2);
-            assert_eq!(mgr.get(k(1, 0))?, Some(v("a")));
-            assert_eq!(mgr.get(k(2, 0))?, Some(v("b")));
-            assert_eq!(mgr.get(k(3, 0))?, Some(v("c")));
-            assert_eq!(mgr.get(k(4, 0))?, Some(v("d")));
+            let region = Region::new(&wal_path)?;
+            assert!(region.get_immutable_ssts().len() >= 2);
+            assert_eq!(region.get(k(1, 0))?, Some(v("a")));
+            assert_eq!(region.get(k(2, 0))?, Some(v("b")));
+            assert_eq!(region.get(k(3, 0))?, Some(v("c")));
+            assert_eq!(region.get(k(4, 0))?, Some(v("d")));
             assert!(manifest_path.exists());
         }
 
         {
-            let mgr = MemtableManager::new(&wal_path)?;
-            assert!(mgr.get_immutable_ssts().len() >= 2);
-            assert_eq!(mgr.get(k(1, 0))?, Some(v("a")));
-            assert_eq!(mgr.get(k(4, 0))?, Some(v("d")));
+            let region = Region::new(&wal_path)?;
+            assert!(region.get_immutable_ssts().len() >= 2);
+            assert_eq!(region.get(k(1, 0))?, Some(v("a")));
+            assert_eq!(region.get(k(4, 0))?, Some(v("d")));
         }
 
         Ok(())
@@ -935,45 +935,45 @@ mod tests {
     fn test_compaction() -> io::Result<()> {
         let dir = tempdir().unwrap();
         let wal_path = dir.path().join("wal.log");
-        let mut mgr = MemtableManager::new(&wal_path)?;
-        mgr.set_flush_threshold(2);
+        let mut region = Region::new(&wal_path)?;
+        region.set_flush_threshold(2);
 
         for i in 0..8 {
             let key = (vec![i as u8], i as i64);
-            mgr.write(key, format!("v{}", i).into_bytes())?;
+            region.write(key, format!("v{}", i).into_bytes())?;
         }
-        assert_eq!(mgr.get_immutable_ssts().len(), 4);
+        assert_eq!(region.get_immutable_ssts().len(), 4);
 
         for i in 0..8 {
             let key = (vec![i as u8], i as i64);
-            assert_eq!(mgr.get(key)?, Some(format!("v{}", i).into_bytes()));
+            assert_eq!(region.get(key)?, Some(format!("v{}", i).into_bytes()));
         }
 
-        mgr.compact()?;
-        assert_eq!(mgr.get_immutable_ssts().len(), 1);
+        region.compact()?;
+        assert_eq!(region.get_immutable_ssts().len(), 1);
 
         for i in 0..8 {
             let key = (vec![i as u8], i as i64);
-            assert_eq!(mgr.get(key)?, Some(format!("v{}", i).into_bytes()));
+            assert_eq!(region.get(key)?, Some(format!("v{}", i).into_bytes()));
         }
 
-        mgr.delete(k(3, 0))?;
-        mgr.delete(k(5, 0))?;
-        mgr.write(k(8, 0), v("v8"))?;
-        mgr.write(k(9, 0), v("v9"))?;
-        mgr.write(k(10, 0), v("v10"))?;
-        mgr.write(k(11, 0), v("v11"))?;
-        assert_eq!(mgr.get_immutable_ssts().len(), 4);
-        mgr.compact()?;
-        assert_eq!(mgr.get_immutable_ssts().len(), 1);
+        region.delete(k(3, 0))?;
+        region.delete(k(5, 0))?;
+        region.write(k(8, 0), v("v8"))?;
+        region.write(k(9, 0), v("v9"))?;
+        region.write(k(10, 0), v("v10"))?;
+        region.write(k(11, 0), v("v11"))?;
+        assert_eq!(region.get_immutable_ssts().len(), 4);
+        region.compact()?;
+        assert_eq!(region.get_immutable_ssts().len(), 1);
 
-        assert_eq!(mgr.get(k(3, 0))?, None);
-        assert_eq!(mgr.get(k(5, 0))?, None);
-        assert_eq!(mgr.get(k(0, 0))?, Some(v("v0")));
-        assert_eq!(mgr.get(k(8, 0))?, Some(v("v8")));
-        assert_eq!(mgr.get(k(9, 0))?, Some(v("v9")));
-        assert_eq!(mgr.get(k(10, 0))?, Some(v("v10")));
-        assert_eq!(mgr.get(k(11, 0))?, Some(v("v11")));
+        assert_eq!(region.get(k(3, 0))?, None);
+        assert_eq!(region.get(k(5, 0))?, None);
+        assert_eq!(region.get(k(0, 0))?, Some(v("v0")));
+        assert_eq!(region.get(k(8, 0))?, Some(v("v8")));
+        assert_eq!(region.get(k(9, 0))?, Some(v("v9")));
+        assert_eq!(region.get(k(10, 0))?, Some(v("v10")));
+        assert_eq!(region.get(k(11, 0))?, Some(v("v11")));
 
         Ok(())
     }
@@ -1024,8 +1024,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let wal_path = dir.path().join("wal.log");
         let schema = Arc::new(schema3());
-        let mut mgr = MemtableManager::with_schema(&wal_path, schema.clone())?;
-        mgr.set_flush_threshold(2);
+        let mut region = Region::with_schema(&wal_path, schema.clone())?;
+        region.set_flush_threshold(2);
 
         let rows = vec![
             (("h1", "c1", 10), 1.5, "a"),
@@ -1038,15 +1038,15 @@ mod tests {
             (("h2", "c1", 30), 8.5, "h"),
         ];
         for ((host, cpu, ts), value, note) in rows.clone() {
-            mgr.write(mkkey(&schema, host, cpu, ts), mkval(&schema, value, note))?;
+            region.write(mkkey(&schema, host, cpu, ts), mkval(&schema, value, note))?;
         }
-        assert_eq!(mgr.get_immutable_ssts().len(), 4);
+        assert_eq!(region.get_immutable_ssts().len(), 4);
 
-        mgr.compact()?;
-        assert_eq!(mgr.get_immutable_ssts().len(), 1);
+        region.compact()?;
+        assert_eq!(region.get_immutable_ssts().len(), 1);
 
         for ((host, cpu, ts), value, note) in rows.clone() {
-            let got = mgr.get(mkkey(&schema, host, cpu, ts))?;
+            let got = region.get(mkkey(&schema, host, cpu, ts))?;
             assert_eq!(
                 got,
                 Some(mkval(&schema, value, note)),
@@ -1056,14 +1056,14 @@ mod tests {
                 ts
             );
         }
-        assert_eq!(mgr.get(mkkey(&schema, "h1", "c1", 99))?, None);
+        assert_eq!(region.get(mkkey(&schema, "h1", "c1", 99))?, None);
 
-        mgr.delete(mkkey(&schema, "h1", "c1", 20))?;
-        mgr.flush()?;
-        mgr.compact()?;
-        assert_eq!(mgr.get(mkkey(&schema, "h1", "c1", 20))?, None);
+        region.delete(mkkey(&schema, "h1", "c1", 20))?;
+        region.flush()?;
+        region.compact()?;
+        assert_eq!(region.get(mkkey(&schema, "h1", "c1", 20))?, None);
         assert_eq!(
-            mgr.get(mkkey(&schema, "h2", "c1", 10))?,
+            region.get(mkkey(&schema, "h2", "c1", 10))?,
             Some(mkval(&schema, 4.5, "d"))
         );
 
@@ -1074,18 +1074,18 @@ mod tests {
     fn test_get_newest_write_wins_across_flush() -> io::Result<()> {
         let dir = tempdir().unwrap();
         let wal_path = dir.path().join("wal.log");
-        let mut mgr = MemtableManager::new(&wal_path)?;
-        mgr.set_flush_threshold(2);
-        mgr.write(k(1, 0), v("old"))?;
-        mgr.write(k(2, 0), v("b"))?;
-        mgr.write(k(1, 0), v("new"))?;
+        let mut region = Region::new(&wal_path)?;
+        region.set_flush_threshold(2);
+        region.write(k(1, 0), v("old"))?;
+        region.write(k(2, 0), v("b"))?;
+        region.write(k(1, 0), v("new"))?;
 
-        assert_eq!(mgr.get(k(1, 0))?, Some(v("new")));
-        mgr.flush()?;
-        assert_eq!(mgr.get(k(1, 0))?, Some(v("new")));
-        mgr.compact()?;
-        assert_eq!(mgr.get(k(1, 0))?, Some(v("new")));
-        assert_eq!(mgr.get(k(2, 0))?, Some(v("b")));
+        assert_eq!(region.get(k(1, 0))?, Some(v("new")));
+        region.flush()?;
+        assert_eq!(region.get(k(1, 0))?, Some(v("new")));
+        region.compact()?;
+        assert_eq!(region.get(k(1, 0))?, Some(v("new")));
+        assert_eq!(region.get(k(2, 0))?, Some(v("b")));
         Ok(())
     }
 
@@ -1095,26 +1095,26 @@ mod tests {
         let wal_path = dir.path().join("wal.log");
 
         {
-            let mgr = MemtableManager::new(&wal_path)?;
-            mgr.write(k(1, 0), v("a"))?;
-            mgr.write(k(2, 0), v("b"))?;
-            mgr.flush()?;
-            let ssts = mgr.get_immutable_ssts();
+            let region = Region::new(&wal_path)?;
+            region.write(k(1, 0), v("a"))?;
+            region.write(k(2, 0), v("b"))?;
+            region.flush()?;
+            let ssts = region.get_immutable_ssts();
             assert_eq!(ssts.len(), 1);
             assert_eq!(ssts[0].max_seq(), 2);
-            mgr.close()?;
+            region.close()?;
         }
 
         {
-            let mgr = MemtableManager::new(&wal_path)?;
-            mgr.write(k(3, 0), v("c"))?;
-            mgr.flush()?;
-            let ssts = mgr.get_immutable_ssts();
+            let region = Region::new(&wal_path)?;
+            region.write(k(3, 0), v("c"))?;
+            region.flush()?;
+            let ssts = region.get_immutable_ssts();
             assert!(ssts.iter().any(|s| s.max_seq() == 3));
 
-            assert_eq!(mgr.get(k(1, 0))?, Some(v("a")));
-            assert_eq!(mgr.get(k(2, 0))?, Some(v("b")));
-            assert_eq!(mgr.get(k(3, 0))?, Some(v("c")));
+            assert_eq!(region.get(k(1, 0))?, Some(v("a")));
+            assert_eq!(region.get(k(2, 0))?, Some(v("b")));
+            assert_eq!(region.get(k(3, 0))?, Some(v("c")));
             Ok(())
         }
     }

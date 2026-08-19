@@ -19,7 +19,7 @@ use datafusion::error::Result as DataFusionResult;
 use futures::Stream;
 
 use crate::{
-    memtable::memtable::MemtableManager,
+    memtable::memtable::Region,
     query::merge::MergeIter,
     schema::{SemanticType, TableSchema, cells_to_array},
     types::{Key, Value},
@@ -71,18 +71,18 @@ impl Stream for LSMStream {
 
 impl LSMStream {
     pub fn new(
-        memtable_manager: Arc<MemtableManager>,
+        region: Arc<Region>,
         schema: SchemaRef,
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
     ) -> io::Result<Self> {
-        let table_schema = memtable_manager.schema();
+        let table_schema = region.schema();
         Ok(Self {
             schema,
             projection,
             limit,
             table_schema,
-            merge: MergeIter::new(memtable_manager.snapshot_sources()?),
+            merge: MergeIter::new(region.snapshot_sources()?),
             batches: Vec::new(),
             index: 0,
             emitted: 0,
@@ -164,7 +164,7 @@ impl LSMStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memtable::MemtableManager;
+    use crate::memtable::Region;
     use futures::StreamExt;
     use tempfile::tempdir;
 
@@ -179,17 +179,17 @@ mod tests {
     fn test_lsm_stream_merges_layers() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("wal.log");
-        let mut mgr = MemtableManager::new(&path).unwrap();
-        mgr.set_flush_threshold(2);
-        mgr.write(key(1, 10), val("a")).unwrap();
-        mgr.write(key(2, 10), val("b")).unwrap();
-        mgr.write(key(1, 10), val("a2")).unwrap();
-        mgr.write(key(3, 10), val("c")).unwrap();
+        let mut region = Region::new(&path).unwrap();
+        region.set_flush_threshold(2);
+        region.write(key(1, 10), val("a")).unwrap();
+        region.write(key(2, 10), val("b")).unwrap();
+        region.write(key(1, 10), val("a2")).unwrap();
+        region.write(key(3, 10), val("c")).unwrap();
 
-        let mgr = Arc::new(mgr);
-        let schema = Arc::new(mgr.schema().arrow_schema());
+        let region = Arc::new(region);
+        let schema = Arc::new(region.schema().arrow_schema());
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let stream = LSMStream::new(mgr, schema, None, None).unwrap();
+        let stream = LSMStream::new(region, schema, None, None).unwrap();
         let batches: Vec<_> = rt.block_on(async { stream.collect::<Vec<_>>().await });
         let mut rows = Vec::new();
         for b in batches {

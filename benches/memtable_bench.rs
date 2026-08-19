@@ -1,7 +1,7 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use mini_mito::MemtableManager;
+use mini_mito::Region;
 use tempfile::tempdir;
 
 fn key(i: u64) -> (Vec<u8>, i64) {
@@ -19,12 +19,14 @@ fn bench_memtable_insert(c: &mut Criterion) {
                 || {
                     let dir = tempdir().unwrap();
                     let path = dir.path().join("wal.log");
-                    let mem = MemtableManager::new(&path).unwrap();
-                    (mem, dir)
+                    let region = Region::new(&path).unwrap();
+                    (region, dir)
                 },
-                |(mem, _dir)| {
+                |(region, _dir)| {
                     for i in 0..size {
-                        mem.write(key(black_box(i)), value(black_box(i))).unwrap();
+                        region
+                            .write(key(black_box(i)), value(black_box(i)))
+                            .unwrap();
                     }
                 },
                 criterion::BatchSize::SmallInput,
@@ -40,14 +42,14 @@ fn bench_memtable_flush(c: &mut Criterion) {
             || {
                 let dir = tempdir().unwrap();
                 let path = dir.path().join("wal.log");
-                let mem = MemtableManager::new(&path).unwrap();
+                let region = Region::new(&path).unwrap();
                 for i in 0..10_000 {
-                    mem.write(key(i), value(i)).unwrap();
+                    region.write(key(i), value(i)).unwrap();
                 }
-                (mem, dir)
+                (region, dir)
             },
-            |(mem, _dir)| {
-                mem.flush().unwrap();
+            |(region, _dir)| {
+                region.flush().unwrap();
             },
             criterion::BatchSize::SmallInput,
         );
@@ -60,14 +62,14 @@ fn bench_memtable_compact(c: &mut Criterion) {
             || {
                 let dir = tempdir().unwrap();
                 let path = dir.path().join("wal.log");
-                let mem = MemtableManager::new(&path).unwrap();
+                let region = Region::new(&path).unwrap();
                 for i in 0..5000 {
-                    mem.write(key(i), value(i)).unwrap();
+                    region.write(key(i), value(i)).unwrap();
                 }
-                (mem, dir)
+                (region, dir)
             },
-            |(mem, _dir)| {
-                mem.compact().unwrap();
+            |(region, _dir)| {
+                region.compact().unwrap();
             },
             criterion::BatchSize::SmallInput,
         );

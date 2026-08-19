@@ -2,7 +2,7 @@ use std::{hint::black_box, sync::Arc};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion::execution::context::SessionContext;
-use mini_mito::{LSMTableProvider, MemtableManager};
+use mini_mito::{LSMTableProvider, Region};
 use tempfile::tempdir;
 use tokio::runtime::Runtime;
 
@@ -16,11 +16,11 @@ fn value(i: u64) -> Vec<u8> {
 fn setup_data(size: usize) -> (Arc<LSMTableProvider>, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
-    let mem = MemtableManager::new(&wal_path).unwrap();
+    let region = Region::new(&wal_path).unwrap();
     for i in 0..size {
-        mem.write(key(i as u64), value(i as u64)).unwrap();
+        region.write(key(i as u64), value(i as u64)).unwrap();
     }
-    let provider = LSMTableProvider::new(mem);
+    let provider = LSMTableProvider::new(region);
     (Arc::new(provider), dir)
 }
 
@@ -75,5 +75,10 @@ fn bench_datafusion_filter(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_datafusion_full_scan, bench_datafusion_projection, bench_datafusion_filter);
+criterion_group!(
+    benches,
+    bench_datafusion_full_scan,
+    bench_datafusion_projection,
+    bench_datafusion_filter
+);
 criterion_main!(benches);

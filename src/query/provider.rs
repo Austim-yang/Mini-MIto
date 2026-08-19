@@ -10,19 +10,19 @@ use datafusion::{
 
 use datafusion::error::Result as DataFusionResult;
 
-use crate::{memtable::memtable::MemtableManager, query::scan::LSMScanExec};
+use crate::{memtable::memtable::Region, query::scan::LSMScanExec};
 
 #[derive(Debug)]
 pub struct LSMTableProvider {
-    memtable_manager: Arc<MemtableManager>,
+    region: Arc<Region>,
     schema: SchemaRef,
 }
 
 impl LSMTableProvider {
-    pub fn new(memtable_manager: MemtableManager) -> Self {
-        let schema = Arc::new(memtable_manager.schema().arrow_schema());
+    pub fn new(region: Region) -> Self {
+        let schema = Arc::new(region.schema().arrow_schema());
         Self {
-            memtable_manager: Arc::new(memtable_manager),
+            region: Arc::new(region),
             schema,
         }
     }
@@ -39,9 +39,9 @@ impl TableProvider for LSMTableProvider {
 
     fn scan<'life0, 'life1, 'life2, 'life3, 'async_trait>(
         &'life0 self,
-        state: &'life1 dyn Session,
+        _state: &'life1 dyn Session,
         projection: Option<&'life2 Vec<usize>>,
-        filters: &'life3 [Expr],
+        _filters: &'life3 [Expr],
         limit: Option<usize>,
     ) -> Pin<Box<dyn Future<Output = DataFusionResult<Arc<dyn ExecutionPlan>>> + Send + 'async_trait>>
     where
@@ -51,12 +51,12 @@ impl TableProvider for LSMTableProvider {
         'life3: 'async_trait,
         Self: 'async_trait,
     {
-        let memtable = self.memtable_manager.clone();
+        let region = self.region.clone();
         let schema = self.schema.clone();
         let projection = projection.cloned();
 
         Box::pin(async move {
-            let exec = LSMScanExec::new(memtable, schema, projection, limit);
+            let exec = LSMScanExec::new(region, schema, projection, limit);
             let plan: Arc<dyn ExecutionPlan> = Arc::new(exec);
             DataFusionResult::Ok(plan)
         })

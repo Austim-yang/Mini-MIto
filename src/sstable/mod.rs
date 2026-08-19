@@ -1,2 +1,2 @@
-pub mod sstable;
 mod bloom;
+pub mod sstable;

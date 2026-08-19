@@ -15,12 +15,12 @@ use datafusion::{
     },
 };
 
-use crate::memtable::memtable::MemtableManager;
+use crate::memtable::memtable::Region;
 use crate::query::stream::LSMStream;
 
 #[derive(Debug)]
 pub struct LSMScanExec {
-    memtable_manager: Arc<MemtableManager>,
+    region: Arc<Region>,
     schema: SchemaRef,
     projected_schema: SchemaRef,
     projection: Option<Vec<usize>>,
@@ -30,7 +30,7 @@ pub struct LSMScanExec {
 
 impl LSMScanExec {
     pub fn new(
-        memtable_manager: Arc<MemtableManager>,
+        region: Arc<Region>,
         schema: SchemaRef,
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
@@ -48,7 +48,7 @@ impl LSMScanExec {
             Boundedness::Bounded,
         ));
         Self {
-            memtable_manager,
+            region,
             schema,
             projected_schema,
             projection,
@@ -81,14 +81,14 @@ impl ExecutionPlan for LSMScanExec {
     fn execute(
         &self,
         partition: usize,
-        context: Arc<TaskContext>,
+        _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         if partition != 0 {
             return Err(DataFusionError::Plan("Only one partition supported".into()));
         }
 
         let stream = LSMStream::new(
-            self.memtable_manager.clone(),
+            self.region.clone(),
             self.projected_schema.clone(),
             self.projection.clone(),
             self.limit,
@@ -104,7 +104,7 @@ impl ExecutionPlan for LSMScanExec {
 impl Clone for LSMScanExec {
     fn clone(&self) -> Self {
         Self {
-            memtable_manager: self.memtable_manager.clone(),
+            region: self.region.clone(),
             schema: self.schema.clone(),
             projected_schema: self.projected_schema.clone(),
             projection: self.projection.clone(),
@@ -115,7 +115,7 @@ impl Clone for LSMScanExec {
 }
 
 impl DisplayAs for LSMScanExec {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> Result<(), Error> {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> Result<(), Error> {
         f.write_str("LSMScanExec")
     }
 }
