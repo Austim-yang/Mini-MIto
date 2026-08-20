@@ -690,6 +690,17 @@ impl Region {
         self.version.lock().unwrap().clone().sources()
     }
 
+    pub fn snapshot_sources_with_range(
+        &self,
+        bounds: (i64, i64),
+    ) -> io::Result<Vec<Box<dyn Iterator<Item = (Key, u64, Option<Value>)>>>> {
+        self.version
+            .lock()
+            .unwrap()
+            .clone()
+            .sources_with_range(bounds)
+    }
+
     pub fn close(&self) -> io::Result<()> {
         let v = self.version.lock().unwrap().clone();
         v.active.close()
@@ -1187,6 +1198,32 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_region_sources_with_range_prunes_ssts() -> io::Result<()> {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal.log");
+        let region = Region::new(&wal_path)?;
+        for i in 0..200i64 {
+            region.write(k(1, 1000 + i), v("low"))?;
+        }
+        region.flush()?;
+        for i in 0..200i64 {
+            region.write(k(1, 5000 + i), v("high"))?;
+        }
+        region.flush()?;
+
+        let sources = region.snapshot_sources_with_range((5000, 5100))?;
+        let mut rows = Vec::new();
+        for src in sources {
+            for (key, _, value) in src {
+                rows.push((key, value));
+            }
+        }
+        assert_eq!(rows.len(), 100);
+        assert!(rows.iter().all(|(k, _)| k.1 >= 5000 && k.1 < 5100));
         Ok(())
     }
 }

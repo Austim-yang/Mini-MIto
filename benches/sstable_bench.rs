@@ -94,6 +94,36 @@ fn bench_sstable_scan(c: &mut Criterion) {
     });
 }
 
+fn bench_sstable_scan_time_range(c: &mut Criterion) {
+    let size: u64 = 100_000;
+    let list = SkipList::new();
+    for i in 0..size {
+        list.insert(key(i), i, Some(value(i)));
+    }
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test.sst");
+    let sst = SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())
+        .unwrap();
+    let min = sst.min_key().clone();
+    let max = sst.max_key().clone();
+
+    c.bench_function("sstable_scan_iter_all_100k", |b| {
+        b.iter(|| {
+            let rows: Vec<_> = sst.scan_iter(&min, &max).unwrap().collect();
+            black_box(rows);
+        });
+    });
+    c.bench_function("sstable_scan_iter_time_range_100k", |b| {
+        b.iter(|| {
+            let rows: Vec<_> = sst
+                .scan_iter_with_range(&min, &max, Some((20_000, 40_000)))
+                .unwrap()
+                .collect();
+            black_box(rows);
+        });
+    });
+}
+
 fn bench_sstable_get_100k(c: &mut Criterion) {
     let size: u64 = 100_000;
     let list = SkipList::new();
@@ -151,6 +181,7 @@ criterion_group!(
     bench_sstable_get,
     bench_sstable_get_100k,
     bench_sstable_scan,
+    bench_sstable_scan_time_range,
     bench_sstable_scan_100k,
 );
 criterion_main!(benches);

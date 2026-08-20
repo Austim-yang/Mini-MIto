@@ -10,7 +10,7 @@ use datafusion::{
 
 use datafusion::error::Result as DataFusionResult;
 
-use crate::{memtable::memtable::Region, query::scan::LSMScanExec};
+use crate::{memtable::memtable::Region, query::{predicate::extract_time_range, scan::LSMScanExec}};
 
 #[derive(Debug)]
 pub struct LSMTableProvider {
@@ -41,7 +41,7 @@ impl TableProvider for LSMTableProvider {
         &'life0 self,
         _state: &'life1 dyn Session,
         projection: Option<&'life2 Vec<usize>>,
-        _filters: &'life3 [Expr],
+        filters: &'life3 [Expr],
         limit: Option<usize>,
     ) -> Pin<Box<dyn Future<Output = DataFusionResult<Arc<dyn ExecutionPlan>>> + Send + 'async_trait>>
     where
@@ -54,9 +54,10 @@ impl TableProvider for LSMTableProvider {
         let region = self.region.clone();
         let schema = self.schema.clone();
         let projection = projection.cloned();
+        let time_range = extract_time_range(filters, region.schema().time_index_name());
 
         Box::pin(async move {
-            let exec = LSMScanExec::new(region, schema, projection, limit);
+            let exec = LSMScanExec::new(region, schema, projection, limit, time_range);
             let plan: Arc<dyn ExecutionPlan> = Arc::new(exec);
             DataFusionResult::Ok(plan)
         })

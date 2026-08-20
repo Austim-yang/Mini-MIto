@@ -53,4 +53,33 @@ impl Version {
         }
         Ok(out)
     }
+
+    pub fn sources_with_range(
+        &self,
+        (lo, hi): (i64, i64),
+    ) -> io::Result<Vec<Box<dyn Iterator<Item = (Key, u64, Option<Value>)>>>> {
+        let mut out: Vec<Box<dyn Iterator<Item = (Key, u64, Option<Value>)>>> = Vec::new();
+        if self.active.len() > 0 {
+            out.push(Box::new(self.active.iter().collect::<Vec<_>>().into_iter()));
+        }
+        for imm in self.immutables.iter().rev() {
+            if imm.len() > 0 {
+                out.push(Box::new(imm.iter().collect::<Vec<_>>().into_iter()));
+            }
+        }
+        for sst in self.ssts.iter().rev() {
+            let overlaps = match sst.ts_extent() {
+                None => true,
+                Some((slo, shi)) => shi >= lo && slo <= hi,
+            };
+            if overlaps {
+                out.push(Box::new(sst.scan_iter_with_range(
+                    sst.min_key(),
+                    sst.max_key(),
+                    Some((lo, hi)),
+                )?));
+            }
+        }
+        Ok(out)
+    }
 }

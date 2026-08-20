@@ -69,6 +69,10 @@ impl TableSchema {
         )
     }
 
+    pub fn time_index_name(&self) -> &str {
+        &self.columns[self.time_index].name
+    }
+
     fn push_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
         out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         out.extend_from_slice(bytes);

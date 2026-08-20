@@ -20,7 +20,7 @@ use futures::Stream;
 
 use crate::{
     memtable::memtable::Region,
-    query::merge::MergeIter,
+    query::{merge::MergeIter, predicate::TimeRange},
     schema::{SemanticType, TableSchema, cells_to_array},
     types::{Key, Value},
 };
@@ -75,14 +75,19 @@ impl LSMStream {
         schema: SchemaRef,
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
+        time_range: TimeRange,
     ) -> io::Result<Self> {
         let table_schema = region.schema();
+        let sources = match time_range.to_inclusive_bounds() {
+            None => Vec::new(),
+            Some(b) => region.snapshot_sources_with_range(b)?,
+        };
         Ok(Self {
             schema,
             projection,
             limit,
             table_schema,
-            merge: MergeIter::new(region.snapshot_sources()?),
+            merge: MergeIter::new(sources),
             batches: Vec::new(),
             index: 0,
             emitted: 0,
@@ -189,7 +194,7 @@ mod tests {
         let region = Arc::new(region);
         let schema = Arc::new(region.schema().arrow_schema());
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let stream = LSMStream::new(region, schema, None, None).unwrap();
+        let stream = LSMStream::new(region, schema, None, None, TimeRange::unbounded()).unwrap();
         let batches: Vec<_> = rt.block_on(async { stream.collect::<Vec<_>>().await });
         let mut rows = Vec::new();
         for b in batches {

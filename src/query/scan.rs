@@ -15,7 +15,7 @@ use datafusion::{
     },
 };
 
-use crate::memtable::memtable::Region;
+use crate::{memtable::memtable::Region, query::predicate::TimeRange};
 use crate::query::stream::LSMStream;
 
 #[derive(Debug)]
@@ -25,6 +25,7 @@ pub struct LSMScanExec {
     projected_schema: SchemaRef,
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
+    time_range: TimeRange,
     properties: Arc<PlanProperties>,
 }
 
@@ -34,6 +35,7 @@ impl LSMScanExec {
         schema: SchemaRef,
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
+        time_range: TimeRange,
     ) -> Self {
         let projected_schema = if let Some(proj) = &projection {
             let fields: Vec<_> = proj.iter().map(|&idx| schema.field(idx).clone()).collect();
@@ -53,6 +55,7 @@ impl LSMScanExec {
             projected_schema,
             projection,
             limit,
+            time_range,
             properties,
         }
     }
@@ -92,6 +95,7 @@ impl ExecutionPlan for LSMScanExec {
             self.projected_schema.clone(),
             self.projection.clone(),
             self.limit,
+            self.time_range,
         )?;
         Ok(Box::pin(stream) as SendableRecordBatchStream)
     }
@@ -109,6 +113,7 @@ impl Clone for LSMScanExec {
             projected_schema: self.projected_schema.clone(),
             projection: self.projection.clone(),
             limit: self.limit,
+            time_range: self.time_range,
             properties: self.properties.clone(),
         }
     }

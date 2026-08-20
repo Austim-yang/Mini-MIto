@@ -26,7 +26,7 @@ use crate::{
 
 const CHUNK_ROWS: usize = 8192;
 const INDEX_META_KEY: &str = "sstable.index";
-const INDEX_VERSION: u32 = 2;
+const INDEX_VERSION: u32 = 3;
 const SEQ_COL: &str = "__seq";
 const OP_COL: &str = "__op_type";
 const OP_PUT: i8 = 0;
@@ -37,6 +37,8 @@ pub(crate) struct RowGroupMeta {
     pub(crate) num_rows: usize,
     pub(crate) min_key: Key,
     pub(crate) max_key: Key,
+    pub(crate) min_ts: i64,
+    pub(crate) max_ts: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -63,6 +65,8 @@ impl SstableIndex {
                     num_rows: rg.num_rows,
                     min_key: hex_key(&rg.min_key),
                     max_key: hex_key(&rg.max_key),
+                    min_ts: rg.min_ts,
+                    max_ts: rg.max_ts,
                 })
                 .collect(),
             max_seq: self.max_seq,
@@ -135,6 +139,12 @@ impl SstableIndex {
         let count = self.row_groups.iter().map(|rg| rg.num_rows).sum();
         (min, max, count)
     }
+
+    pub(crate) fn ts_extent(&self) -> Option<(i64, i64)> {
+        let low = self.row_groups.iter().map(|rg| rg.min_ts).min()?;
+        let high = self.row_groups.iter().map(|rg| rg.max_ts).max()?;
+        Some((low, high))
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -156,6 +166,8 @@ struct RowGroupDto {
     num_rows: usize,
     min_key: HexKeyDto,
     max_key: HexKeyDto,
+    min_ts: i64,
+    max_ts: i64,
 }
 #[derive(Serialize, Deserialize)]
 struct HexKeyDto {
@@ -174,6 +186,8 @@ fn from_row_group_dto(d: &RowGroupDto) -> io::Result<RowGroupMeta> {
         num_rows: d.num_rows,
         min_key: (from_hex(&d.min_key.tag)?, d.min_key.ts),
         max_key: (from_hex(&d.max_key.tag)?, d.max_key.ts),
+        min_ts: d.min_ts,
+        max_ts: d.max_ts,
     })
 }
 
@@ -379,6 +393,8 @@ impl SSTable {
         let mut chunk_rows: usize = 0;
         let mut chunk_min: Option<Key> = None;
         let mut chunk_max: Option<Key> = None;
+        let mut chunk_min_ts: Option<i64> = None;
+        let mut chunk_max_ts: Option<i64> = None;
 
         for (key, seq, value) in skiplist.iter() {
             if !include_tombstones && value.is_none() {
@@ -391,12 +407,16 @@ impl SSTable {
                 chunk_min = Some(key.clone());
             }
             chunk_max = Some(key.clone());
+            chunk_min_ts = Some(chunk_min_ts.map_or(key.1, |t| t.min(key.1)));
+            chunk_max_ts = Some(chunk_max_ts.map_or(key.1, |t| t.max(key.1)));
             chunk_rows += 1;
             if chunk_rows == CHUNK_ROWS {
                 row_groups.push(RowGroupMeta {
                     num_rows: chunk_rows,
                     min_key: chunk_min.take().unwrap(),
                     max_key: chunk_max.take().unwrap(),
+                    min_ts: chunk_min_ts.take().unwrap(),
+                    max_ts: chunk_max_ts.take().unwrap(),
                 });
                 chunk_rows = 0;
             }
@@ -407,6 +427,8 @@ impl SSTable {
                 num_rows: chunk_rows,
                 min_key: chunk_min.unwrap(),
                 max_key: chunk_max.unwrap(),
+                min_ts: chunk_min_ts.unwrap(),
+                max_ts: chunk_max_ts.unwrap(),
             });
         }
 
@@ -550,6 +572,40 @@ impl SSTable {
         (first <= last).then_some((first, last))
     }
 
+    fn select_row_groups(
+        rgs: &[RowGroupMeta],
+        start: &Key,
+        end: &Key,
+        ts: Option<(i64, i64)>,
+    ) -> Option<Vec<usize>> {
+        if rgs.is_empty() {
+            return None;
+        }
+        let first = rgs.partition_point(|rg| rg.max_key < *start);
+        let last = rgs
+            .partition_point(|rg| rg.min_key <= *end)
+            .saturating_sub(1);
+        if first > last {
+            return None;
+        }
+        match ts {
+            None => Some((first..=last).collect()),
+            Some((low, high)) => {
+                let selected: Vec<usize> = (first..=last)
+                    .filter(|&i| {
+                        let rg = &rgs[i];
+                        !(rg.max_ts < low || rg.min_ts > high)
+                    })
+                    .collect();
+                if selected.is_empty() {
+                    None
+                } else {
+                    Some(selected)
+                }
+            }
+        }
+    }
+
     pub fn scan(&self, start: &Key, end: &Key) -> io::Result<Vec<(Key, u64, Option<Value>)>> {
         if self.entry_count == 0 || start > end || end < &self.min_key || start > &self.max_key {
             return Ok(Vec::new());
@@ -627,6 +683,44 @@ impl SSTable {
         })
     }
 
+    pub fn scan_iter_with_range(
+        &self,
+        start: &Key,
+        end: &Key,
+        ts: Option<(i64, i64)>,
+    ) -> io::Result<SSTableIter> {
+        if self.entry_count == 0 || start > end || end < &self.min_key || start > &self.max_key {
+            return Ok(SSTableIter::empty(
+                start.clone(),
+                end.clone(),
+                self.schema.clone(),
+            ));
+        }
+
+        let Some(rgs) = Self::select_row_groups(&self.index.row_groups, start, end, ts) else {
+            return Ok(SSTableIter::empty(
+                start.clone(),
+                end.clone(),
+                self.schema.clone(),
+            ));
+        };
+
+        let file = File::open(&self.path)?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let reader = builder.with_row_groups(rgs).build()?;
+        Ok(SSTableIter {
+            inner: Box::new(
+                reader.map(|r| r.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))),
+            ),
+            current: Vec::new(),
+            pos: 0,
+            start: start.clone(),
+            end: end.clone(),
+            schema: self.schema.clone(),
+        })
+    }
+
     pub fn id(&self) -> usize {
         self.id
     }
@@ -649,6 +743,10 @@ impl SSTable {
 
     pub fn max_key(&self) -> &Key {
         &self.max_key
+    }
+
+    pub fn ts_extent(&self) -> Option<(i64, i64)> {
+        self.index.ts_extent()
     }
 }
 
@@ -997,11 +1095,15 @@ mod tests {
                     num_rows: 50,
                     min_key: k(0, 0),
                     max_key: k(4, 49),
+                    min_ts: 0,
+                    max_ts: 49,
                 },
                 RowGroupMeta {
                     num_rows: 50,
                     min_key: k(4, 50),
                     max_key: k(9, 99),
+                    min_ts: 50,
+                    max_ts: 99,
                 },
             ],
             max_seq: 99,
@@ -1031,7 +1133,7 @@ mod tests {
     #[test]
     fn index_json_rejects_bad_base64() {
         let err = SstableIndex::from_json(
-            r#"{"version":2,"bloom":{"m":1024,"k":1,"seed":0,"bits":"!!!not-base64!!!"},"row_groups":[],"max_seq":0}"#,
+            r#"{"version":3,"bloom":{"m":1024,"k":1,"seed":0,"bits":"!!!not-base64!!!"},"row_groups":[],"max_seq":0}"#,
         );
         assert!(err.is_err());
     }
@@ -1039,8 +1141,8 @@ mod tests {
     #[test]
     fn index_json_rejects_bad_hex() {
         let err = SstableIndex::from_json(
-            r#"{"version":2,"bloom":{"m":1024,"k":1,"seed":0,"bits":"AA=="},
-                "row_groups":[{"num_rows":1,"min_key":{"tag":"zz","ts":0},"max_key":{"tag":"aa","ts":1}}],
+            r#"{"version":3,"bloom":{"m":1024,"k":1,"seed":0,"bits":"AA=="},
+                "row_groups":[{"num_rows":1,"min_key":{"tag":"zz","ts":0},"max_key":{"tag":"aa","ts":1},"min_ts":0,"max_ts":1}],
                 "max_seq":0}"#,
         );
         assert!(err.is_err());
@@ -1149,6 +1251,84 @@ mod tests {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         assert!(SSTable::open_from_path(&path, &schema).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_select_row_groups_ts() {
+        let rgs = vec![
+            RowGroupMeta {
+                num_rows: 1,
+                min_key: k(0, 0),
+                max_key: k(0, 1),
+                min_ts: 0,
+                max_ts: 100,
+            },
+            RowGroupMeta {
+                num_rows: 1,
+                min_key: k(0, 2),
+                max_key: k(0, 3),
+                min_ts: 200,
+                max_ts: 300,
+            },
+            RowGroupMeta {
+                num_rows: 1,
+                min_key: k(0, 4),
+                max_key: k(0, 5),
+                min_ts: 400,
+                max_ts: 500,
+            },
+        ];
+        let sel = SSTable::select_row_groups(&rgs, &k(0, 0), &k(0, 5), Some((250, 450))).unwrap();
+        assert_eq!(sel, vec![1, 2]);
+        assert!(SSTable::select_row_groups(&rgs, &k(0, 0), &k(0, 5), Some((301, 399))).is_none());
+        let all = SSTable::select_row_groups(&rgs, &k(0, 0), &k(0, 5), None).unwrap();
+        assert_eq!(all, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_sstable_ts_pruning_multi_tag_sound() -> io::Result<()> {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mt.sst");
+        let list = SkipList::new();
+        list.insert(k(10, 100), 1, Some(v("a")));
+        list.insert(k(20, 50), 2, Some(v("b")));
+        list.insert(k(20, 90), 3, Some(v("c")));
+        let sst =
+            SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())?;
+        assert_eq!(sst.ts_extent(), Some((50, 100)));
+
+        let got: Vec<_> = sst
+            .scan_iter_with_range(sst.min_key(), sst.max_key(), Some((i64::MIN, 59)))?
+            .collect();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, k(20, 50));
+        Ok(())
+    }
+
+    #[test]
+    fn test_sstable_ts_pruning_row_groups() -> io::Result<()> {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rg.sst");
+        let list = SkipList::new();
+        for i in 0..24_576i64 {
+            list.insert((vec![1], i), i as u64 + 1, Some(v(&format!("v{}", i))));
+        }
+        let sst =
+            SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())?;
+        assert_eq!(sst.ts_extent(), Some((0, 24_575)));
+
+        let got: Vec<_> = sst
+            .scan_iter_with_range(sst.min_key(), sst.max_key(), Some((9000, 9200)))?
+            .collect();
+        assert_eq!(got.len(), 201);
+        assert_eq!(got[0].0, k(1, 9000));
+        assert_eq!(got[200].0, k(1, 9200));
+
+        let got: Vec<_> = sst
+            .scan_iter_with_range(sst.min_key(), sst.max_key(), Some((30_000, 40_000)))?
+            .collect();
+        assert!(got.is_empty());
         Ok(())
     }
 }
