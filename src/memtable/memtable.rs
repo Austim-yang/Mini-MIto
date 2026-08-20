@@ -1222,8 +1222,8 @@ mod tests {
                 rows.push((key, value));
             }
         }
-        assert_eq!(rows.len(), 100);
-        assert!(rows.iter().all(|(k, _)| k.1 >= 5000 && k.1 < 5100));
+        assert_eq!(rows.len(), 101);
+        assert!(rows.iter().all(|(k, _)| k.1 >= 5000 && k.1 <= 5100));
         Ok(())
     }
 }

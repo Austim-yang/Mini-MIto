@@ -4,7 +4,7 @@ use std::{
     fs::{self, File},
     io,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     vec,
 };
 
@@ -354,6 +354,7 @@ pub struct SSTable {
     entry_count: usize,
     schema: Arc<TableSchema>,
     index: Arc<SstableIndex>,
+    row_cache: Arc<Mutex<HashMap<usize, Arc<Vec<(Key, u64, Option<Value>)>>>>>,
 }
 
 impl SSTable {
@@ -375,6 +376,7 @@ impl SSTable {
             max_seq: index.max_seq,
             schema,
             index,
+            row_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -483,6 +485,7 @@ impl SSTable {
             max_seq,
             schema: Arc::new(schema.clone()),
             index: Arc::new(index),
+            row_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -515,6 +518,43 @@ impl SSTable {
         (rg.min_key <= *key).then_some(i)
     }
 
+    fn load_row_group(&self, rg: usize) -> io::Result<Arc<Vec<(Key, u64, Option<Value>)>>> {
+        if let Some(rows) = self.row_cache.lock().unwrap().get(&rg) {
+            return Ok(rows.clone());
+        }
+
+        let file = File::open(&self.path)?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let reader = builder.with_row_groups(vec![rg]).build()?;
+
+        let field_cols: Vec<usize> = self
+            .schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.semantic == SemanticType::Field)
+            .map(|(c, _)| c)
+            .collect();
+
+        let mut rows = Vec::new();
+        for batch_result in reader {
+            let batch = batch_result.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let view = BatchView::new(&batch, &self.schema);
+            for i in 0..batch.num_rows() {
+                rows.push((
+                    key_at(&view, &self.schema, i),
+                    view.seq_value(i) as u64,
+                    value_at(&view, &self.schema, &field_cols, i),
+                ));
+            }
+        }
+
+        let rows = Arc::new(rows);
+        self.row_cache.lock().unwrap().insert(rg, rows.clone());
+        Ok(rows)
+    }
+
     pub fn get(&self, key: &Key) -> io::Result<Option<(u64, Option<Value>)>> {
         if self.entry_count == 0 || key < &self.min_key || key > &self.max_key {
             return Ok(None);
@@ -528,32 +568,13 @@ impl SSTable {
             return Ok(None);
         };
 
-        let file = File::open(&self.path)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let reader = builder.with_row_groups(vec![rg]).build()?;
-
-        for batch_result in reader {
-            let batch = batch_result.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let view = BatchView::new(&batch, &self.schema);
-            let field_cols: Vec<usize> = self
-                .schema
-                .columns
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| c.semantic == SemanticType::Field)
-                .map(|(c, _)| c)
-                .collect();
-
-            for i in 0..batch.num_rows() {
-                let k = key_at(&view, &self.schema, i);
-                if k > *key {
-                    return Ok(None);
-                }
-                if k == *key {
-                    let seq = view.seq_value(i) as u64;
-                    return Ok(Some((seq, value_at(&view, &self.schema, &field_cols, i))));
-                }
+        let rows = self.load_row_group(rg)?;
+        for (k, seq, value) in rows.iter() {
+            if k > key {
+                break;
+            }
+            if k == key {
+                return Ok(Some((*seq, value.clone())));
             }
         }
 
@@ -679,6 +700,7 @@ impl SSTable {
             pos: 0,
             start: start.clone(),
             end: end.clone(),
+            ts_range: None,
             schema: self.schema.clone(),
         })
     }
@@ -717,6 +739,7 @@ impl SSTable {
             pos: 0,
             start: start.clone(),
             end: end.clone(),
+            ts_range: ts,
             schema: self.schema.clone(),
         })
     }
@@ -756,6 +779,7 @@ pub struct SSTableIter {
     pos: usize,
     start: Key,
     end: Key,
+    ts_range: Option<(i64, i64)>,
     schema: Arc<TableSchema>,
 }
 
@@ -767,6 +791,7 @@ impl SSTableIter {
             pos: 0,
             start,
             end,
+            ts_range: None,
             schema,
         }
     }
@@ -794,6 +819,11 @@ impl SSTableIter {
                             break;
                         }
                         if k >= self.start {
+                            if let Some((low, high)) = self.ts_range
+                                && (k.1 < low || k.1 > high)
+                            {
+                                continue;
+                            }
                             self.current.push((
                                 k,
                                 view.seq_value(i) as u64,

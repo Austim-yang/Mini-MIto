@@ -68,6 +68,7 @@ fn swap_op(op: Operator) -> Operator {
 
 fn scalar_to_i64(v: &ScalarValue) -> Option<i64> {
     match v {
+        ScalarValue::Int32(Some(x)) => Some(*x as i64),
         ScalarValue::Int64(Some(x)) => Some(*x),
         ScalarValue::TimestampNanosecond(Some(x), None) => Some(*x),
         _ => None,
