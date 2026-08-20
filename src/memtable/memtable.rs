@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::{self},
     io::{self, BufRead, Write},
     path::{Path, PathBuf},
@@ -6,6 +7,7 @@ use std::{
         Arc, Mutex, RwLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -224,6 +226,9 @@ pub struct Region {
     schema: Arc<TableSchema>,
     write_gate: Arc<RwLock<()>>,
     flush_lock: Mutex<()>,
+    ttl: Option<i64>,
+    window_size: i64,
+    compact_threshold: usize,
 }
 
 impl Region {
@@ -256,6 +261,9 @@ impl Region {
             schema,
             write_gate: Arc::new(RwLock::new(())),
             flush_lock: Mutex::new(()),
+            ttl: None,
+            window_size: 3_600_000_000_000,
+            compact_threshold: 4,
         };
         let mut ssts: Vec<SSTable> = Vec::new();
         region.load_manifest(&mut ssts)?;
@@ -474,6 +482,7 @@ impl Region {
             v.active.write_batch(entries)?;
         }
         self.maybe_flush()?;
+        self.maybe_compact()?;
         Ok(())
     }
 
@@ -485,6 +494,7 @@ impl Region {
             v.active.write(key, seq, value)?
         };
         self.maybe_flush()?;
+        self.maybe_compact()?;
         Ok(result)
     }
 
@@ -502,8 +512,38 @@ impl Region {
         Ok(())
     }
 
+    fn maybe_compact(&self) -> io::Result<()> {
+        let n = self.version.lock().unwrap().clone().ssts.len();
+        if n < self.compact_threshold {
+            return Ok(());
+        }
+        self.compact()
+    }
+
     pub fn set_flush_threshold(&mut self, threshold: usize) {
         self.flush_threshold = threshold;
+    }
+
+    pub fn set_ttl(&mut self, ttl: Option<i64>) {
+        self.ttl = ttl;
+    }
+
+    pub fn set_window_size(&mut self, w: i64) {
+        self.window_size = w.max(1);
+    }
+
+    pub fn set_compact_threshold(&mut self, t: usize) {
+        self.compact_threshold = t;
+    }
+
+    pub fn ttl_cutoff(&self) -> Option<i64> {
+        self.ttl.map(|ttl| {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as i64;
+            now.saturating_sub(ttl)
+        })
     }
 
     pub fn sst_id(&self) -> usize {
@@ -511,6 +551,12 @@ impl Region {
     }
 
     pub fn get(&self, key: Key) -> io::Result<Option<Value>> {
+        if let Some(c) = self.ttl_cutoff()
+            && key.1 < c
+        {
+            return Ok(None);
+        }
+
         let v = self.version.lock().unwrap().clone();
         let mut best: Option<(u64, Option<Value>)> = None;
 
@@ -594,26 +640,57 @@ impl Region {
     pub fn compact(&self) -> io::Result<()> {
         let _flush = self.flush_lock.lock().unwrap();
         let v = self.version.lock().unwrap().clone();
-        if v.ssts.len() < 4 {
+        if v.ssts.len() < self.compact_threshold {
             return Ok(());
         }
-        let old_paths: Vec<PathBuf> = v.ssts.iter().map(|s| s.path().clone()).collect();
+
+        let cutoff = self.ttl_cutoff();
+        let mut groups: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+        for (i, sst) in v.ssts.iter().enumerate() {
+            let Some((min_ts, _)) = sst.ts_extent() else {
+                continue;
+            };
+            groups
+                .entry(min_ts.div_euclid(self.window_size))
+                .or_default()
+                .push(i);
+        }
+        let Some((_, target)) = groups
+            .iter()
+            .find(|(_, idxs)| idxs.len() >= self.compact_threshold)
+        else {
+            return Ok(());
+        };
+
+        let old_paths: Vec<PathBuf> = target.iter().map(|&i| v.ssts[i].path().clone()).collect();
         let merged_skiplist = SkipList::new();
-        for sst in v.ssts.iter() {
-            let rows = sst.scan(sst.min_key(), sst.max_key())?;
-            for (k, seq, v) in rows {
+        let clamp = cutoff.map(|c| (c, i64::MAX));
+        for &i in target {
+            let sst = &v.ssts[i];
+            for (k, seq, v) in sst.scan_iter_with_range(sst.min_key(), sst.max_key(), clamp)? {
                 merged_skiplist.insert(k, seq, v);
             }
         }
-        let id = self.sst_id.load(Ordering::SeqCst);
-        let path = self.base_dir.join(format!("{:04}.sst", id));
-        let new_sst =
-            SSTable::create_from_skiplist(&merged_skiplist, id, &path, true, &self.schema)?;
-        self.sst_id.fetch_add(1, Ordering::SeqCst);
+        let mut ssts: Vec<SSTable> = v
+            .ssts
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !target.contains(i))
+            .map(|(_, s)| s.clone())
+            .collect();
+        if merged_skiplist.len() > 0 {
+            let id = self.sst_id.load(Ordering::SeqCst);
+            let path = self.base_dir.join(format!("{:04}.sst", id));
+            let new_sst =
+                SSTable::create_from_skiplist(&merged_skiplist, id, &path, true, &self.schema)?;
+            self.sst_id.fetch_add(1, Ordering::SeqCst);
+            ssts.push(new_sst);
+        }
+        ssts.sort_by_key(|s| s.id());
         self.swap_version(Version {
             active: v.active.clone(),
             immutables: v.immutables.clone(),
-            ssts: vec![new_sst],
+            ssts,
             seq: v.seq,
         });
         self.write_manifest()?;
@@ -736,6 +813,13 @@ mod tests {
     }
     fn v(s: &str) -> Value {
         s.as_bytes().to_vec()
+    }
+
+    fn now_nanos() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as i64
     }
 
     #[test]
@@ -883,12 +967,13 @@ mod tests {
         let wal_path = dir.path().join("wal.log");
         let mut region = Region::new(&wal_path)?;
         region.set_flush_threshold(2);
+        region.set_compact_threshold(2);
 
         for i in 0..8 {
             let key = (vec![i as u8], i as i64);
             region.write(key, format!("v{}", i).into_bytes())?;
         }
-        assert_eq!(region.get_immutable_ssts().len(), 4);
+        assert_eq!(region.get_immutable_ssts().len(), 1);
 
         for i in 0..8 {
             let key = (vec![i as u8], i as i64);
@@ -909,7 +994,7 @@ mod tests {
         region.write(k(9, 0), v("v9"))?;
         region.write(k(10, 0), v("v10"))?;
         region.write(k(11, 0), v("v11"))?;
-        assert_eq!(region.get_immutable_ssts().len(), 4);
+        assert_eq!(region.get_immutable_ssts().len(), 1);
         region.compact()?;
         assert_eq!(region.get_immutable_ssts().len(), 1);
 
@@ -986,7 +1071,7 @@ mod tests {
         for ((host, cpu, ts), value, note) in rows.clone() {
             region.write(mkkey(&schema, host, cpu, ts), mkval(&schema, value, note))?;
         }
-        assert_eq!(region.get_immutable_ssts().len(), 4);
+        assert_eq!(region.get_immutable_ssts().len(), 1);
 
         region.compact()?;
         assert_eq!(region.get_immutable_ssts().len(), 1);
@@ -1224,6 +1309,170 @@ mod tests {
         }
         assert_eq!(rows.len(), 101);
         assert!(rows.iter().all(|(k, _)| k.1 >= 5000 && k.1 <= 5100));
+        Ok(())
+    }
+
+    #[test]
+    fn test_twcs_does_not_merge_across_windows() -> io::Result<()> {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal.log");
+        let mut region = Region::new(&wal_path)?;
+        region.set_flush_threshold(2);
+        region.set_compact_threshold(4);
+        region.set_window_size(10);
+
+        for i in 0..8i64 {
+            region.write(k(1, i), v("old"))?;
+        }
+        let win0 = region.get_immutable_ssts();
+        assert_eq!(win0.len(), 1);
+        assert_eq!(win0[0].ts_extent(), Some((0, 7)));
+
+        for i in 20..28i64 {
+            region.write(k(1, i), v("new"))?;
+        }
+        let ssts = region.get_immutable_ssts();
+        assert_eq!(ssts.len(), 2);
+        for sst in &ssts {
+            let (lo, hi) = sst.ts_extent().unwrap();
+            assert!((lo < 10 && hi <= 9) || lo >= 20, "merged across windows");
+        }
+        assert_eq!(region.get(k(1, 5))?, Some(v("old")));
+        assert_eq!(region.get(k(1, 25))?, Some(v("new")));
+        Ok(())
+    }
+
+    #[test]
+    fn test_ttl_compact_removes_expired() -> io::Result<()> {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal.log");
+        let mut region = Region::new(&wal_path)?;
+        region.set_flush_threshold(2);
+        region.set_compact_threshold(4);
+        region.set_ttl(Some(1_000_000_000));
+        let expired = now_nanos() - 60_000_000_000;
+
+        for i in 0..8i64 {
+            region.write(k(1, expired + i), v("expired"))?;
+        }
+        assert_eq!(region.get_immutable_ssts().len(), 0);
+        assert_eq!(region.get(k(1, expired))?, None);
+        assert_eq!(region.get(k(1, expired + 7))?, None);
+
+        let fresh = now_nanos();
+        region.write(k(1, fresh), v("fresh"))?;
+        assert_eq!(region.get(k(1, fresh))?, Some(v("fresh")));
+        Ok(())
+    }
+
+    #[test]
+    fn test_ttl_read_clamp_without_compact() -> io::Result<()> {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal.log");
+        let mut region = Region::new(&wal_path)?;
+        region.set_ttl(Some(1_000_000_000));
+        let now = now_nanos();
+
+        region.write(k(1, now - 60_000_000_000), v("old"))?;
+        region.write(k(1, now), v("fresh"))?;
+
+        assert_eq!(region.get(k(1, now - 60_000_000_000))?, None);
+        assert_eq!(region.get(k(1, now))?, Some(v("fresh")));
+        Ok(())
+    }
+
+    #[test]
+    fn test_ttl_tombstone_and_seq() -> io::Result<()> {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal.log");
+        let mut region = Region::new(&wal_path)?;
+        region.set_flush_threshold(2);
+        region.set_compact_threshold(2);
+        region.set_ttl(Some(1_000_000_000));
+        let now = now_nanos();
+
+        region.write(k(1, now), v("a"))?;
+        region.flush()?;
+        region.delete(k(1, now))?;
+        region.flush()?;
+        assert_eq!(region.get(k(1, now))?, None);
+        region.compact()?;
+        assert_eq!(region.get(k(1, now))?, None);
+
+        let expired = now - 60_000_000_000;
+        region.write(k(2, expired), v("b"))?;
+        region.flush()?;
+        region.delete(k(2, expired))?;
+        region.flush()?;
+        assert_eq!(region.get(k(2, expired))?, None);
+        region.compact()?;
+        assert_eq!(region.get(k(2, expired))?, None);
+        let mut found = false;
+        for sst in region.get_immutable_ssts() {
+            for (key, _, _) in sst.scan(sst.min_key(), sst.max_key())? {
+                if key == k(2, expired) {
+                    found = true;
+                }
+            }
+        }
+        assert!(!found, "expired tombstone should be physically removed");
+        Ok(())
+    }
+
+    #[test]
+    fn test_empty_window_compact_no_orphan_sst() -> io::Result<()> {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal.log");
+        let mut region = Region::new(&wal_path)?;
+        region.set_flush_threshold(2);
+        region.set_compact_threshold(2);
+        region.set_ttl(Some(1_000_000_000));
+        let expired = now_nanos() - 60_000_000_000;
+
+        for i in 0..4i64 {
+            region.write(k(1, expired + i), v("x"))?;
+        }
+        assert_eq!(region.get_immutable_ssts().len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_maybe_compact_auto_triggers() -> io::Result<()> {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal.log");
+        let mut region = Region::new(&wal_path)?;
+        region.set_flush_threshold(2);
+        region.set_compact_threshold(2);
+
+        for i in 0..6i64 {
+            region.write(k(1, i), v("x"))?;
+            assert!(region.get_immutable_ssts().len() <= 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_ttl_compact_survives_reopen() -> io::Result<()> {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal.log");
+        let expired = now_nanos() - 60_000_000_000;
+        let fresh = now_nanos();
+        {
+            let mut region = Region::new(&wal_path)?;
+            region.set_flush_threshold(2);
+            region.set_compact_threshold(2);
+            region.set_ttl(Some(1_000_000_000));
+            for i in 0..4i64 {
+                region.write(k(1, expired + i), v("old"))?;
+            }
+            for i in 0..4i64 {
+                region.write(k(2, fresh + i), v("new"))?;
+            }
+            region.close()?;
+        }
+        let region = Region::new(&wal_path)?;
+        assert_eq!(region.get(k(1, expired))?, None);
+        assert_eq!(region.get(k(2, fresh))?, Some(v("new")));
         Ok(())
     }
 }

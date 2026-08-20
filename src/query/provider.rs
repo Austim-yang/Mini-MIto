@@ -10,7 +10,10 @@ use datafusion::{
 
 use datafusion::error::Result as DataFusionResult;
 
-use crate::{memtable::memtable::Region, query::{predicate::extract_time_range, scan::LSMScanExec}};
+use crate::{
+    memtable::memtable::Region,
+    query::{predicate::extract_time_range, scan::LSMScanExec},
+};
 
 #[derive(Debug)]
 pub struct LSMTableProvider {
@@ -54,7 +57,10 @@ impl TableProvider for LSMTableProvider {
         let region = self.region.clone();
         let schema = self.schema.clone();
         let projection = projection.cloned();
-        let time_range = extract_time_range(filters, region.schema().time_index_name());
+        let mut time_range = extract_time_range(filters, region.schema().time_index_name());
+        if let Some(c) = region.ttl_cutoff() {
+            time_range.min = Some(time_range.min.map_or(c, |m| m.max(c)));
+        }
 
         Box::pin(async move {
             let exec = LSMScanExec::new(region, schema, projection, limit, time_range);

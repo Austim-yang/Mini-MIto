@@ -62,7 +62,8 @@ fn bench_memtable_compact(c: &mut Criterion) {
             || {
                 let dir = tempdir().unwrap();
                 let path = dir.path().join("wal.log");
-                let region = Region::new(&path).unwrap();
+                let mut region = Region::new(&path).unwrap();
+                region.set_compact_threshold(1_000);
                 for i in 0..5000 {
                     region.write(key(i), value(i)).unwrap();
                 }
@@ -76,10 +77,55 @@ fn bench_memtable_compact(c: &mut Criterion) {
     });
 }
 
+const WINDOW_1H: i64 = 3_600_000_000_000;
+
+fn bench_memtable_twcs(c: &mut Criterion) {
+    let mut group = c.benchmark_group("memtable_auto_compact_50k");
+    group.bench_function("same_window", |b| {
+        b.iter_batched(
+            || {
+                let dir = tempdir().unwrap();
+                let path = dir.path().join("wal.log");
+                let mut region = Region::new(&path).unwrap();
+                region.set_flush_threshold(1_000);
+                region.set_compact_threshold(4);
+                (region, dir)
+            },
+            |(region, _dir)| {
+                for i in 0..50_000u64 {
+                    region.write(key(i), value(i)).unwrap();
+                }
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+    group.bench_function("many_windows", |b| {
+        b.iter_batched(
+            || {
+                let dir = tempdir().unwrap();
+                let path = dir.path().join("wal.log");
+                let mut region = Region::new(&path).unwrap();
+                region.set_flush_threshold(1_000);
+                region.set_compact_threshold(4);
+                (region, dir)
+            },
+            |(region, _dir)| {
+                for i in 0..50_000u64 {
+                    let ts = (i / 100) as i64 * WINDOW_1H;
+                    region.write((vec![1], ts), value(i)).unwrap();
+                }
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_memtable_insert,
     bench_memtable_flush,
-    bench_memtable_compact
+    bench_memtable_compact,
+    bench_memtable_twcs,
 );
 criterion_main!(benches);
