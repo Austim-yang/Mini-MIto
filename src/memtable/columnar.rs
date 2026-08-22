@@ -184,9 +184,9 @@ impl Memtable for ColumnarMemtable {
     }
 
     fn write_batch(&self, entries: Vec<(Key, u64, Option<Value>)>) -> io::Result<()> {
-        let mut wal_gruard = self.wal.lock().unwrap();
-        for (key, seq, value) in &entries {
-            let op = match value {
+        let ops: Vec<Operation> = entries
+            .iter()
+            .map(|(key, seq, value)| match value {
                 Some(v) => Operation::Insert {
                     key: key.clone(),
                     seq: *seq,
@@ -196,10 +196,9 @@ impl Memtable for ColumnarMemtable {
                     key: key.clone(),
                     seq: *seq,
                 },
-            };
-            wal_gruard.append(&op)?;
-        }
-        drop(wal_gruard);
+            })
+            .collect();
+        self.wal.lock().unwrap().append_batch(&ops)?;
         for (key, seq, value) in entries {
             self.insert_row(key.0.into_boxed_slice(), key.1, seq, value);
         }

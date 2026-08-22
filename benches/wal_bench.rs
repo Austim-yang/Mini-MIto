@@ -1,7 +1,10 @@
 use std::hint::black_box;
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use mini_mito::memtable::{Wal, wal::Operation};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use mini_mito::memtable::{
+    Wal,
+    wal::{Operation, SyncPolicy},
+};
 use tempfile::tempdir;
 
 fn key(i: u64) -> (Vec<u8>, i64) {
@@ -19,7 +22,8 @@ fn bench_wal_append(c: &mut Criterion) {
                 || {
                     let dir = tempdir().unwrap();
                     let path = dir.path().join("wal.log");
-                    let wal = Wal::new(&path).unwrap();
+                    let wal = mini_mito::memtable::Wal::with_sync_policy(&path, SyncPolicy::Never)
+                        .unwrap();
                     (wal, dir)
                 },
                 |(mut wal, _dir)| {
@@ -78,5 +82,35 @@ fn bench_wal_recover(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_wal_append, bench_wal_recover);
+fn bench_wal_append_frame(c: &mut Criterion) {
+    let mut group = c.benchmark_group("wal_bulk_append_frame");
+    for batch_size in [10, 50, 100, 500].iter() {
+        let ops: Vec<Operation> = (0..*batch_size)
+            .map(|i| Operation::Insert {
+                key: key(i),
+                seq: i,
+                value: value(i),
+            })
+            .collect();
+        group.throughput(Throughput::Elements(*batch_size));
+        group.bench_with_input(BenchmarkId::from_parameter(batch_size), &ops, |b, ops| {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("frame.log");
+            let mut wal =
+                mini_mito::memtable::Wal::with_sync_policy(&path, SyncPolicy::Never).unwrap();
+            b.iter(|| {
+                wal.append_batch(black_box(ops)).unwrap();
+            });
+            wal.close().unwrap();
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_wal_append,
+    bench_wal_recover,
+    bench_wal_append_frame
+);
 criterion_main!(benches);
