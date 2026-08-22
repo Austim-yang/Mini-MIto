@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fmt::Debug,
     io,
     path::{Path, PathBuf},
@@ -14,8 +14,8 @@ use arrow::array::RecordBatch;
 use crate::{
     Key, Value,
     memtable::{ImmutableMemtable, Memtable, Wal, wal::Operation},
-    schema::TableSchema,
-    sstable::sstable::internal_batch_from_rows,
+    schema::{BatchView, TableSchema},
+    sstable::sstable::{internal_batch_from_rows, key_at},
 };
 
 const DEFAULT_SHARDS: usize = 16;
@@ -61,11 +61,16 @@ fn materialize_series(
         let (row_a, row_b) = (&rows[a as usize], &rows[b as usize]);
         row_a.0.cmp(&row_b.0).then(row_b.1.cmp(&row_a.1))
     });
+    let mut last_ts: Option<i64> = None;
     let sorted: Vec<(Key, u64, Option<Value>)> = idx
         .into_iter()
-        .map(|i| {
+        .filter_map(|i| {
             let (ts, seq, v) = &rows[i as usize];
-            ((tags.to_vec(), *ts), *seq, v.clone())
+            if last_ts == Some(*ts) {
+                return None;
+            }
+            last_ts = Some(*ts);
+            Some(((tags.to_vec(), *ts), *seq, v.clone()))
         })
         .collect();
     internal_batch_from_rows(&sorted, schema)
@@ -235,14 +240,18 @@ impl Memtable for ColumnarMemtable {
     }
 
     fn to_batches(&self, schema: &TableSchema) -> io::Result<Vec<Arc<RecordBatch>>> {
-        let mut out = Vec::new();
+        let mut batches = Vec::new();
         for shard in self.shards.iter() {
             let s = shard.lock().unwrap();
             for (tags, rows) in s.series.iter() {
-                out.push(Arc::new(materialize_series(tags, rows, schema)?));
+                batches.push(Arc::new(materialize_series(tags, rows, schema)?));
             }
         }
-        Ok(out)
+        batches.sort_by_key(|b| {
+            let view = BatchView::new(b, schema);
+            key_at(&view, schema, 0)
+        });
+        Ok(batches)
     }
 
     fn len(&self) -> usize {
@@ -255,7 +264,7 @@ impl Memtable for ColumnarMemtable {
 
     fn freeze(&self) -> io::Result<Box<dyn ImmutableMemtable>> {
         self.wal.lock().unwrap().close()?;
-        let mut series = HashMap::new();
+        let mut series = BTreeMap::new();
         for shard in self.shards.iter() {
             let s = shard.lock().unwrap();
             for (tags, rows) in s.series.iter() {
@@ -299,7 +308,7 @@ impl Debug for ColumnarMemtable {
 }
 
 struct FrozenColumnar {
-    series: HashMap<Box<[u8]>, SeriesRows>,
+    series: BTreeMap<Box<[u8]>, SeriesRows>,
     row_count: usize,
     total_bytes: usize,
     max_seq_v: u64,

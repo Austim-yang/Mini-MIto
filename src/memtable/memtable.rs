@@ -5,8 +5,10 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering},
+        mpsc::{self, Receiver, SyncSender},
     },
+    thread::JoinHandle,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -36,9 +38,208 @@ pub struct ManifestEntry {
     entry_count: usize,
 }
 
+enum Job {
+    Flush(Arc<dyn ImmutableMemtable>),
+    Compact,
+    Sync(mpsc::Sender<()>),
+    Shutdown,
+}
+
+struct WorkerState {
+    version: Arc<Mutex<Arc<Version>>>,
+    schema: Arc<TableSchema>,
+    base_dir: PathBuf,
+    manifest_path: PathBuf,
+    sst_id: Arc<AtomicUsize>,
+    window_size: Arc<AtomicI64>,
+    ttl: Arc<AtomicI64>,
+    compact_threshold: Arc<AtomicUsize>,
+    error: Arc<Mutex<Option<String>>>,
+}
+
+impl WorkerState {
+    fn record_error(&self, e: io::Error) {
+        let mut slot = self.error.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(e.to_string());
+        }
+    }
+
+    fn flush_one(&self, imm: &Arc<dyn ImmutableMemtable>) -> io::Result<()> {
+        let id = self.sst_id.load(Ordering::SeqCst);
+        let path = self.base_dir.join(format!("{:04}.sst", id));
+        let batches = imm.to_batches(&self.schema)?;
+        let sst = SSTable::create_from_batches(&batches, id, &path, &self.schema)?;
+        self.sst_id.fetch_add(1, Ordering::SeqCst);
+
+        {
+            let mut cur = self.version.lock().unwrap();
+            let v = (*cur).clone();
+            let mut ssts = v.ssts.clone();
+            ssts.push(sst);
+            ssts.sort_by_key(|s| s.id());
+            let immutables: Vec<Arc<dyn ImmutableMemtable>> = v
+                .immutables
+                .iter()
+                .filter(|i| !Arc::ptr_eq(*i, imm))
+                .cloned()
+                .collect();
+            *cur = Arc::new(Version {
+                active: v.active.clone(),
+                immutables,
+                ssts,
+                seq: v.seq,
+            });
+        }
+        write_manifest(&self.version, &self.manifest_path)?;
+        let _ = fs::remove_file(imm.wal_path());
+        Ok(())
+    }
+
+    fn compact(&self) -> io::Result<()> {
+        let v = self.version.lock().unwrap().clone();
+        if v.ssts.len() < self.compact_threshold.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        let window = self.window_size.load(Ordering::SeqCst).max(1);
+        let cutoff = {
+            let ttl = self.ttl.load(Ordering::SeqCst);
+            if ttl == i64::MIN {
+                None
+            } else {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+                    .as_nanos() as i64;
+                Some(now.saturating_sub(ttl))
+            }
+        };
+
+        let mut groups: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+        for (i, sst) in v.ssts.iter().enumerate() {
+            let Some((min_ts, _)) = sst.ts_extent() else {
+                continue;
+            };
+            groups.entry(min_ts.div_euclid(window)).or_default().push(i);
+        }
+        let Some((_, idxs)) = groups
+            .iter()
+            .find(|(_, idxs)| idxs.len() >= self.compact_threshold.load(Ordering::SeqCst))
+        else {
+            return Ok(());
+        };
+        let target_ids: Vec<usize> = idxs.iter().map(|&i| v.ssts[i].id()).collect();
+
+        let old_paths: Vec<PathBuf> = idxs.iter().map(|&i| v.ssts[i].path().clone()).collect();
+        let clamp = cutoff.map(|c| (c, i64::MAX));
+        let mut sources = Vec::with_capacity(idxs.len());
+        for &i in idxs {
+            let sst = &v.ssts[i];
+            sources.push(Source::Sst(sst.scan_batches(
+                sst.min_key(),
+                sst.max_key(),
+                clamp,
+            )?));
+        }
+
+        let mut merge = MergeBatchIter::new(sources, self.schema.clone());
+        let mut merged_batches: Vec<Arc<RecordBatch>> = Vec::new();
+        loop {
+            match merge.next_batch()? {
+                Some(batch) => merged_batches.push(Arc::new(batch)),
+                None => break,
+            }
+        }
+
+        {
+            let mut cur = self.version.lock().unwrap();
+            let cv = (*cur).clone();
+            let mut ssts: Vec<SSTable> = cv
+                .ssts
+                .iter()
+                .filter(|s| !target_ids.contains(&s.id()))
+                .cloned()
+                .collect();
+            if !merged_batches.is_empty() {
+                let id = self.sst_id.load(Ordering::SeqCst);
+                let path = self.base_dir.join(format!("{:04}.sst", id));
+                let new_sst =
+                    SSTable::create_from_batches(&merged_batches, id, &path, &self.schema)?;
+                self.sst_id.fetch_add(1, Ordering::SeqCst);
+                ssts.push(new_sst);
+            }
+            ssts.sort_by_key(|s| s.id());
+            *cur = Arc::new(Version {
+                active: cv.active.clone(),
+                immutables: cv.immutables.clone(),
+                ssts,
+                seq: cv.seq,
+            });
+        }
+        write_manifest(&self.version, &self.manifest_path)?;
+        for p in old_paths {
+            let _ = fs::remove_file(p);
+        }
+        Ok(())
+    }
+}
+
+fn worker_loop(rx: Receiver<Job>, st: Arc<WorkerState>) {
+    while let Ok(job) = rx.recv() {
+        match job {
+            Job::Flush(imm) => {
+                if let Err(e) = st.flush_one(&imm) {
+                    st.record_error(e);
+                }
+            }
+            Job::Compact => {
+                if st.error.lock().unwrap().is_none() {
+                    if let Err(e) = st.compact() {
+                        st.record_error(e);
+                    }
+                }
+            }
+            Job::Sync(tx) => {
+                let _ = tx.send(());
+            }
+            Job::Shutdown => break,
+        }
+    }
+}
+
+fn write_manifest(version: &Mutex<Arc<Version>>, manifest_path: &Path) -> io::Result<()> {
+    let tmp_path = manifest_path.with_extension("tmp");
+    let file = fs::File::create(&tmp_path)?;
+    let mut writer = io::BufWriter::new(file);
+    let ssts = &version.lock().unwrap().clone().ssts;
+    for sst in ssts.iter() {
+        let entry = super::memtable::ManifestEntry {
+            id: sst.id(),
+            path: sst
+                .path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            min_key: sst.min_key().clone(),
+            max_key: sst.max_key().clone(),
+            entry_count: sst.entry_count(),
+        };
+        let line = serde_json::to_string(&entry)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        writer.write_all(line.as_bytes())?;
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    fs::rename(&tmp_path, manifest_path)?;
+    Ok(())
+}
+
 pub struct Region {
     version: Arc<Mutex<Arc<Version>>>,
-    sst_id: AtomicUsize,
+    sst_id: Arc<AtomicUsize>,
     seq: AtomicU64,
     base_dir: PathBuf,
     max_memory_bytes: usize,
@@ -46,11 +247,13 @@ pub struct Region {
     manifest_path: PathBuf,
     schema: Arc<TableSchema>,
     write_gate: Arc<RwLock<()>>,
-    flush_lock: Mutex<()>,
-    ttl: Option<i64>,
-    window_size: i64,
-    compact_threshold: usize,
+    ttl: Arc<AtomicI64>,
+    window_size: Arc<AtomicI64>,
+    compact_threshold: Arc<AtomicUsize>,
     immutable_batch_cache: Mutex<HashMap<usize, Arc<Vec<Arc<RecordBatch>>>>>,
+    job_tx: SyncSender<Job>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+    bg_error: Arc<Mutex<Option<String>>>,
 }
 
 impl Region {
@@ -69,13 +272,14 @@ impl Region {
             schema.clone(),
             base_dir.join("wal_000.log"),
         )?) as Box<dyn Memtable>);
+        let (job_tx, job_rx) = mpsc::sync_channel::<Job>(8);
         let mut region = Self {
             version: Arc::new(Mutex::new(Arc::new(Version::new(
                 initial_active,
                 Vec::new(),
                 0,
             )))),
-            sst_id: AtomicUsize::new(0),
+            sst_id: Arc::new(AtomicUsize::new(0)),
             seq: AtomicU64::new(0),
             base_dir: base_dir.clone(),
             max_memory_bytes: 1024 * 1024 * 10,
@@ -83,12 +287,29 @@ impl Region {
             manifest_path: manifest_path.clone(),
             schema,
             write_gate: Arc::new(RwLock::new(())),
-            flush_lock: Mutex::new(()),
-            ttl: None,
-            window_size: 3_600_000_000_000,
-            compact_threshold: 4,
+            ttl: Arc::new(AtomicI64::new(i64::MIN)),
+            window_size: Arc::new(AtomicI64::new(3_600_000_000_000)),
+            compact_threshold: Arc::new(AtomicUsize::new(4)),
             immutable_batch_cache: Mutex::new(HashMap::new()),
+            job_tx,
+            worker: Mutex::new(None),
+            bg_error: Arc::new(Mutex::new(None)),
         };
+        let st = Arc::new(WorkerState {
+            version: region.version.clone(),
+            schema: region.schema.clone(),
+            base_dir: region.base_dir.clone(),
+            manifest_path: region.manifest_path.clone(),
+            sst_id: region.sst_id.clone(),
+            window_size: region.window_size.clone(),
+            ttl: region.ttl.clone(),
+            compact_threshold: region.compact_threshold.clone(),
+            error: region.bg_error.clone(),
+        });
+        let handle = std::thread::Builder::new()
+            .name("mini-mito-flusher".into())
+            .spawn(move || worker_loop(job_rx, st))?;
+        region.worker = Mutex::new(Some(handle));
         let mut ssts: Vec<SSTable> = Vec::new();
         region.load_manifest(&mut ssts)?;
         let found = region.scan_sst_files(&mut ssts)?;
@@ -262,32 +483,7 @@ impl Region {
     }
 
     fn write_manifest(&self) -> io::Result<()> {
-        let tmp_path = self.manifest_path.with_extension("tmp");
-        let file = fs::File::create(&tmp_path)?;
-        let mut writer = io::BufWriter::new(file);
-        let ssts = &self.version.lock().unwrap().clone().ssts;
-        for sst in ssts.iter() {
-            let entry = super::memtable::ManifestEntry {
-                id: sst.id(),
-                path: sst
-                    .path()
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned(),
-                min_key: sst.min_key().clone(),
-                max_key: sst.max_key().clone(),
-                entry_count: sst.entry_count(),
-            };
-            let line = serde_json::to_string(&entry)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            writer.write_all(line.as_bytes())?;
-            writer.write_all(b"\n")?;
-        }
-        writer.flush()?;
-        writer.get_ref().sync_all()?;
-        fs::rename(&tmp_path, &self.manifest_path)?;
-        Ok(())
+        write_manifest(&self.version, &self.manifest_path)
     }
 
     pub fn write(&self, key: Key, value: Value) -> io::Result<Option<Value>> {
@@ -328,6 +524,29 @@ impl Region {
         Ok(result)
     }
 
+    fn freeze_active(&self) -> io::Result<Option<Arc<dyn ImmutableMemtable>>> {
+        let _gate = self.write_gate.write().unwrap();
+        let v = self.version.lock().unwrap().clone();
+        if v.active.len() == 0 {
+            return Ok(None);
+        }
+        let new_active: Arc<dyn Memtable> = Arc::from(v.active.fork()?);
+        let imm: Arc<dyn ImmutableMemtable> = Arc::from(v.active.freeze()?);
+        {
+            let mut cur = self.version.lock().unwrap();
+            let cv = (**cur).clone();
+            let mut immutables = cv.immutables;
+            immutables.push(imm.clone());
+            *cur = Arc::new(Version {
+                active: new_active,
+                immutables,
+                ssts: cv.ssts,
+                seq: cv.seq,
+            });
+        }
+        Ok(Some(imm))
+    }
+
     fn maybe_flush(&self) -> io::Result<()> {
         let v = self.version.lock().unwrap().clone();
         let active_len = v.active.len();
@@ -337,17 +556,20 @@ impl Region {
                 .map(|i| i.estimated_size())
                 .sum::<usize>();
         if total > self.max_memory_bytes || active_len >= self.flush_threshold {
-            self.schedule_flush()?;
+            if let Some(imm) = self.freeze_active()? {
+                self.enqueue(Job::Flush(imm))?;
+            }
         }
         Ok(())
     }
 
     fn maybe_compact(&self) -> io::Result<()> {
-        let n = self.version.lock().unwrap().clone().ssts.len();
-        if n < self.compact_threshold {
-            return Ok(());
+        let v = self.version.lock().unwrap().clone();
+        let n = v.ssts.len() + v.immutables.len();
+        if n >= self.compact_threshold.load(Ordering::SeqCst) {
+            self.enqueue(Job::Compact)?;
         }
-        self.compact()
+        Ok(())
     }
 
     pub fn set_flush_threshold(&mut self, threshold: usize) {
@@ -355,25 +577,27 @@ impl Region {
     }
 
     pub fn set_ttl(&mut self, ttl: Option<i64>) {
-        self.ttl = ttl;
+        self.ttl.store(ttl.unwrap_or(i64::MIN), Ordering::SeqCst);
     }
 
     pub fn set_window_size(&mut self, w: i64) {
-        self.window_size = w.max(1);
+        self.window_size.store(w.max(1), Ordering::SeqCst);
     }
 
     pub fn set_compact_threshold(&mut self, t: usize) {
-        self.compact_threshold = t;
+        self.compact_threshold.store(t, Ordering::SeqCst);
     }
 
     pub fn ttl_cutoff(&self) -> Option<i64> {
-        self.ttl.map(|ttl| {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as i64;
-            now.saturating_sub(ttl)
-        })
+        let ttl = self.ttl.load(Ordering::SeqCst);
+        if ttl == i64::MIN {
+            return None;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as i64;
+        Some(now.saturating_sub(ttl))
     }
 
     pub fn sst_id(&self) -> usize {
@@ -416,130 +640,15 @@ impl Region {
     }
 
     pub fn flush(&self) -> io::Result<()> {
-        self.schedule_flush()?;
-        Ok(())
-    }
-
-    fn schedule_flush(&self) -> io::Result<()> {
-        let _flush = self.flush_lock.lock().unwrap();
-        {
-            let _gate = self.write_gate.write().unwrap();
-            let v = self.version.lock().unwrap().clone();
-            if v.active.len() == 0 {
-                return Ok(());
-            }
-            let new_active: Arc<dyn Memtable> = Arc::from(v.active.fork()?);
-            let imm: Arc<dyn ImmutableMemtable> = Arc::from(v.active.freeze()?);
-            self.swap_version(v.with_frozen(new_active, imm));
+        if let Some(imm) = self.freeze_active()? {
+            self.enqueue(Job::Flush(imm))?;
         }
-        self.flush_immutables()?;
-        Ok(())
-    }
-
-    fn flush_immutables(&self) -> io::Result<()> {
-        let v = self.version.lock().unwrap().clone();
-        if v.immutables.is_empty() {
-            return Ok(());
-        }
-        let mut new_ssts = Vec::new();
-        let mut flushed_wals: Vec<PathBuf> = Vec::new();
-        for imm in v.immutables.iter() {
-            let id = self.sst_id.load(Ordering::SeqCst);
-            let path = self.base_dir.join(format!("{:04}.sst", id));
-            let batches = imm.to_batches(&self.schema)?;
-            let sst = SSTable::create_from_batches(&batches, id, &path, &self.schema)?;
-            self.sst_id.fetch_add(1, Ordering::SeqCst);
-            new_ssts.push(sst);
-            flushed_wals.push(imm.wal_path().to_path_buf());
-        }
-        let mut ssts = v.ssts.clone();
-        ssts.extend(new_ssts);
-        ssts.sort_by_key(|s| s.id());
-        self.swap_version(Version {
-            active: v.active.clone(),
-            immutables: Vec::new(),
-            ssts,
-            seq: v.seq,
-        });
-        self.write_manifest()?;
-        for p in flushed_wals {
-            let _ = fs::remove_file(p);
-        }
-        Ok(())
+        self.flush_barrier()
     }
 
     pub fn compact(&self) -> io::Result<()> {
-        let _flush = self.flush_lock.lock().unwrap();
-        let v = self.version.lock().unwrap().clone();
-        if v.ssts.len() < self.compact_threshold {
-            return Ok(());
-        }
-
-        let cutoff = self.ttl_cutoff();
-        let mut groups: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
-        for (i, sst) in v.ssts.iter().enumerate() {
-            let Some((min_ts, _)) = sst.ts_extent() else {
-                continue;
-            };
-            groups
-                .entry(min_ts.div_euclid(self.window_size))
-                .or_default()
-                .push(i);
-        }
-        let Some((_, target)) = groups
-            .iter()
-            .find(|(_, idxs)| idxs.len() >= self.compact_threshold)
-        else {
-            return Ok(());
-        };
-
-        let old_paths: Vec<PathBuf> = target.iter().map(|&i| v.ssts[i].path().clone()).collect();
-        let clamp = cutoff.map(|c| (c, i64::MAX));
-        let mut sources = Vec::with_capacity(target.len());
-        for &i in target {
-            let sst = &v.ssts[i];
-            sources.push(Source::Sst(sst.scan_batches(
-                sst.min_key(),
-                sst.max_key(),
-                clamp,
-            )?));
-        }
-
-        let mut merge = MergeBatchIter::new(sources, self.schema.clone());
-        let mut merged_batches: Vec<Arc<RecordBatch>> = Vec::new();
-        loop {
-            match merge.next_batch()? {
-                Some(batch) => merged_batches.push(Arc::new(batch)),
-                None => break,
-            }
-        }
-
-        let mut ssts: Vec<SSTable> = v
-            .ssts
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| !target.contains(i))
-            .map(|(_, s)| s.clone())
-            .collect();
-        if !merged_batches.is_empty() {
-            let id = self.sst_id.load(Ordering::SeqCst);
-            let path = self.base_dir.join(format!("{:04}.sst", id));
-            let new_sst = SSTable::create_from_batches(&merged_batches, id, &path, &self.schema)?;
-            self.sst_id.fetch_add(1, Ordering::SeqCst);
-            ssts.push(new_sst);
-        }
-        ssts.sort_by_key(|s| s.id());
-        self.swap_version(Version {
-            active: v.active.clone(),
-            immutables: v.immutables.clone(),
-            ssts,
-            seq: v.seq,
-        });
-        self.write_manifest()?;
-        for p in old_paths {
-            let _ = fs::remove_file(p);
-        }
-        Ok(())
+        self.enqueue(Job::Compact)?;
+        self.flush_barrier()
     }
 
     pub fn len(&self) -> usize {
@@ -637,8 +746,49 @@ impl Region {
     }
 
     pub fn close(&self) -> io::Result<()> {
+        self.flush_barrier()?;
+        self.shutdown_worker();
+        self.check_bg_error()?;
         let v = self.version.lock().unwrap().clone();
         v.active.close()
+    }
+
+    fn enqueue(&self, job: Job) -> io::Result<()> {
+        self.check_bg_error()?;
+        self.job_tx
+            .send(job)
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "flusher terminated"))
+    }
+
+    fn check_bg_error(&self) -> io::Result<()> {
+        let guard = self.bg_error.lock().unwrap();
+        match &*guard {
+            Some(msg) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("background flusher failed: {msg}"),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    pub fn flush_barrier(&self) -> io::Result<()> {
+        self.check_bg_error()?;
+        let (tx, rx) = mpsc::channel();
+        self.enqueue(Job::Sync(tx))?;
+        rx.recv().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "flusher terminated before barrier",
+            )
+        })?;
+        self.check_bg_error()
+    }
+
+    fn shutdown_worker(&self) {
+        if let Some(handle) = self.worker.lock().unwrap().take() {
+            let _ = self.job_tx.send(Job::Shutdown);
+            let _ = handle.join();
+        }
     }
 }
 
@@ -654,6 +804,14 @@ impl std::fmt::Debug for Region {
             .field("ssts_count", &v.ssts.len())
             .field("immutables_count", &v.immutables.len())
             .finish()
+    }
+}
+
+impl Drop for Region {
+    fn drop(&mut self) {
+        let _ = self.flush_barrier();
+        self.shutdown_worker();
+        let _ = self.check_bg_error();
     }
 }
 
@@ -764,10 +922,12 @@ mod tests {
 
         region.write(k(1, 0), v("a"))?;
         region.write(k(2, 0), v("b"))?;
+        region.flush_barrier()?;
         assert_eq!(region.get_immutable_ssts().len(), 1);
 
         region.write(k(3, 0), v("c"))?;
         region.write(k(4, 0), v("d"))?;
+        region.flush_barrier()?;
         assert_eq!(region.get_immutable_ssts().len(), 2);
 
         assert_eq!(region.get(k(1, 0))?, Some(v("a")));
@@ -831,6 +991,7 @@ mod tests {
             let key = (vec![i as u8], i as i64);
             region.write(key, format!("v{}", i).into_bytes())?;
         }
+        region.flush_barrier()?;
         assert_eq!(region.get_immutable_ssts().len(), 1);
 
         for i in 0..8 {
@@ -852,6 +1013,7 @@ mod tests {
         region.write(k(9, 0), v("v9"))?;
         region.write(k(10, 0), v("v10"))?;
         region.write(k(11, 0), v("v11"))?;
+        region.flush_barrier()?;
         assert_eq!(region.get_immutable_ssts().len(), 1);
         region.compact()?;
         assert_eq!(region.get_immutable_ssts().len(), 1);
@@ -1200,6 +1362,7 @@ mod tests {
         for i in 0..8i64 {
             region.write(k(1, i), v("old"))?;
         }
+        region.flush_barrier()?;
         let win0 = region.get_immutable_ssts();
         assert_eq!(win0.len(), 1);
         assert_eq!(win0[0].ts_extent(), Some((0, 7)));
@@ -1207,6 +1370,7 @@ mod tests {
         for i in 20..28i64 {
             region.write(k(1, i), v("new"))?;
         }
+        region.flush_barrier()?;
         let ssts = region.get_immutable_ssts();
         assert_eq!(ssts.len(), 2);
         for sst in &ssts {
@@ -1231,6 +1395,7 @@ mod tests {
         for i in 0..8i64 {
             region.write(k(1, expired + i), v("expired"))?;
         }
+        region.flush_barrier()?;
         assert_eq!(region.get_immutable_ssts().len(), 0);
         assert_eq!(region.get(k(1, expired))?, None);
         assert_eq!(region.get(k(1, expired + 7))?, None);
@@ -1313,6 +1478,7 @@ mod tests {
         for i in 0..4i64 {
             region.write(k(1, expired + i), v("x"))?;
         }
+        region.flush_barrier()?;
         assert_eq!(region.get_immutable_ssts().len(), 0);
         Ok(())
     }

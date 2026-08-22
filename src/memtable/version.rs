@@ -7,6 +7,7 @@ use crate::{
     sstable::sstable::{SSTable, SSTableBatchIter},
 };
 
+#[derive(Clone)]
 pub struct Version {
     pub active: Arc<dyn Memtable>,
     pub immutables: Vec<Arc<dyn ImmutableMemtable>>,
