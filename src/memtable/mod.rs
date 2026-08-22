@@ -1,3 +1,4 @@
+pub mod columnar;
 pub mod memtable;
 pub mod skiptable;
 pub mod traits;

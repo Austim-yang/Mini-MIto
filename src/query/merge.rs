@@ -258,7 +258,9 @@ impl Iterator for MergeBatchIter {
 mod tests {
     use super::*;
     use crate::{
-        Key, Value, schema::SemanticType, sstable::sstable::{internal_batch_from_rows, key_at, value_at, OP_DELETE, OP_PUT},
+        Key, Value,
+        schema::SemanticType,
+        sstable::sstable::{OP_DELETE, OP_PUT, internal_batch_from_rows, key_at, value_at},
     };
 
     fn default_schema() -> Arc<TableSchema> {
@@ -266,7 +268,9 @@ mod tests {
     }
 
     fn mem_source(schema: &TableSchema, rows: Vec<(Key, u64, Option<Value>)>) -> Source {
-        Source::memtable(internal_batch_from_rows(&rows, schema).unwrap())
+        Source::memtable(vec![Arc::new(
+            internal_batch_from_rows(&rows, schema).unwrap(),
+        )])
     }
 
     fn merged_rows(m: MergeBatchIter, schema: &TableSchema) -> Vec<(Key, u64, i8, Option<Value>)> {

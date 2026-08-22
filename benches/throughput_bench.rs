@@ -152,7 +152,7 @@ fn bench_compaction(c: &mut Criterion) {
                         .collect();
                     let merge =
                         MergeBatchIter::new(sources, Arc::new(TableSchema::default_table()));
-                    let merged: Vec<_> = merge.map(|b| b.unwrap()).collect();
+                    let merged: Vec<_> = merge.map(|b| Arc::new(b.unwrap())).collect();
                     let _new_sst = SSTable::create_from_batches(
                         &merged,
                         99,

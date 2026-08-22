@@ -1,4 +1,4 @@
-use std::{io, path::Path};
+use std::{io, path::Path, sync::Arc};
 
 use arrow::array::RecordBatch;
 
@@ -10,7 +10,7 @@ pub trait Memtable: Send + Sync {
     fn replay(&self, op: &Operation) -> io::Result<()>;
     fn get(&self, key: &Key) -> io::Result<Option<(u64, Option<Value>)>>;
     fn max_seq(&self) -> u64;
-    fn to_record_batch(&self, schema: &TableSchema) -> io::Result<RecordBatch>;
+    fn to_batches(&self, schema: &TableSchema) -> io::Result<Vec<Arc<RecordBatch>>>;
     fn len(&self) -> usize;
     fn estimated_size(&self) -> usize;
     fn freeze(&self) -> io::Result<Box<dyn ImmutableMemtable>>;
@@ -21,7 +21,7 @@ pub trait Memtable: Send + Sync {
 pub trait ImmutableMemtable: Send + Sync {
     fn get(&self, key: &Key) -> io::Result<Option<(u64, Option<Value>)>>;
     fn max_seq(&self) -> u64;
-    fn to_record_batch(&self, schema: &TableSchema) -> io::Result<RecordBatch>;
+    fn to_batches(&self, schema: &TableSchema) -> io::Result<Vec<Arc<RecordBatch>>>;
     fn len(&self) -> usize;
     fn estimated_size(&self) -> usize;
     fn wal_path(&self) -> &Path;

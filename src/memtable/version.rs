@@ -1,4 +1,4 @@
-use std::{io, sync::Arc};
+use std::{io, sync::Arc, vec::IntoIter};
 
 use arrow::array::RecordBatch;
 
@@ -42,18 +42,18 @@ impl Version {
 
 pub enum Source {
     Sst(SSTableBatchIter),
-    Memtable(Option<Arc<RecordBatch>>),
+    Memtable(IntoIter<Arc<RecordBatch>>),
 }
 
 impl Source {
-    pub fn memtable(batch: RecordBatch) -> Self {
-        Source::Memtable(Some(Arc::new(batch)))
+    pub fn memtable(batches: Vec<Arc<RecordBatch>>) -> Self {
+        Source::Memtable(batches.into_iter())
     }
 
     pub fn next_batch(&mut self) -> io::Result<Option<Arc<RecordBatch>>> {
         match self {
             Source::Sst(iter) => iter.next().transpose().map(|o| o.map(Arc::new)),
-            Source::Memtable(slot) => Ok(slot.take()),
+            Source::Memtable(iter) => Ok(iter.next()),
         }
     }
 }

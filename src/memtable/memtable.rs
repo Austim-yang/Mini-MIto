@@ -16,10 +16,15 @@ use serde::{Deserialize, Serialize};
 use crate::{
     memtable::{
         SkipList, Wal,
+        columnar::ColumnarMemtable,
         traits::{ImmutableMemtable, Memtable},
         version::{Source, Version},
         wal::Operation,
-    }, query::merge::MergeBatchIter, schema::{BatchView, SemanticType, TableSchema}, sstable::sstable::{SSTable, SstableIndex, internal_batch_from_rows, key_at, value_at}, types::{Key, Value},
+    },
+    query::merge::MergeBatchIter,
+    schema::{BatchView, SemanticType, TableSchema},
+    sstable::sstable::{SSTable, SstableIndex, internal_batch_from_rows, key_at, value_at},
+    types::{Key, Value},
 };
 
 #[derive(Serialize, Deserialize)]
@@ -96,9 +101,9 @@ impl Memtable for MutableSkipListMemtable {
         self.inner.max_seq()
     }
 
-    fn to_record_batch(&self, schema: &TableSchema) -> io::Result<RecordBatch> {
+    fn to_batches(&self, schema: &TableSchema) -> io::Result<Vec<Arc<RecordBatch>>> {
         let rows: Vec<(Key, u64, Option<Value>)> = self.inner.iter().collect();
-        internal_batch_from_rows(&rows, schema)
+        Ok(vec![Arc::new(internal_batch_from_rows(&rows, schema)?)])
     }
 
     fn len(&self) -> usize {
@@ -181,9 +186,9 @@ impl ImmutableMemtable for ImmutableSkipListMemtable {
         self.inner.len() * 64
     }
 
-    fn to_record_batch(&self, schema: &TableSchema) -> io::Result<RecordBatch> {
+    fn to_batches(&self, schema: &TableSchema) -> io::Result<Vec<Arc<RecordBatch>>> {
         let rows: Vec<(Key, u64, Option<Value>)> = self.inner.iter().collect();
-        internal_batch_from_rows(&rows, schema)
+        Ok(vec![Arc::new(internal_batch_from_rows(&rows, schema)?)])
     }
 
     fn wal_path(&self) -> &Path {
@@ -205,7 +210,7 @@ pub struct Region {
     ttl: Option<i64>,
     window_size: i64,
     compact_threshold: usize,
-    immutable_batch_cache: Mutex<HashMap<usize, Arc<RecordBatch>>>,
+    immutable_batch_cache: Mutex<HashMap<usize, Arc<Vec<Arc<RecordBatch>>>>>,
 }
 
 impl Region {
@@ -220,12 +225,13 @@ impl Region {
             .unwrap_or(Path::new("."))
             .to_path_buf();
         let manifest_path = base_dir.join("manifest");
+        let initial_active = Arc::from(Box::new(ColumnarMemtable::with_default_config(
+            schema.clone(),
+            base_dir.join("wal_000.log"),
+        )?) as Box<dyn Memtable>);
         let mut region = Self {
             version: Arc::new(Mutex::new(Arc::new(Version::new(
-                Arc::from(
-                    Box::new(MutableSkipListMemtable::new(base_dir.join("wal_000.log"))?)
-                        as Box<dyn Memtable>,
-                ),
+                initial_active,
                 Vec::new(),
                 0,
             )))),
@@ -261,14 +267,15 @@ impl Region {
         wal_files.sort();
 
         let active: Arc<dyn Memtable> = match wal_files.pop() {
-            Some(last_wal) => {
-                Arc::from(Box::new(MutableSkipListMemtable::new(last_wal)?) as Box<dyn Memtable>)
-            }
+            Some(last_wal) => Arc::from(Box::new(ColumnarMemtable::with_default_config(
+                region.schema.clone(),
+                last_wal,
+            )?) as Box<dyn Memtable>),
             None => region.version.lock().unwrap().active.clone(),
         };
         region.merge_orphan_wals(&wal_files, active.as_ref())?;
 
-        let watermark = {
+        let watermark = { 
             let mut w = 0u64;
             w = w.max(active.max_seq());
             for sst in ssts.iter() {
@@ -594,13 +601,8 @@ impl Region {
         for imm in v.immutables.iter() {
             let id = self.sst_id.load(Ordering::SeqCst);
             let path = self.base_dir.join(format!("{:04}.sst", id));
-            let batch = imm.to_record_batch(&self.schema)?;
-            let sst = SSTable::create_from_batches(
-                std::slice::from_ref(&batch),
-                id,
-                &path,
-                &self.schema,
-            )?;
+            let batches = imm.to_batches(&self.schema)?;
+            let sst = SSTable::create_from_batches(&batches, id, &path, &self.schema)?;
             self.sst_id.fetch_add(1, Ordering::SeqCst);
             new_ssts.push(sst);
             flushed_wals.push(imm.wal_path().to_path_buf());
@@ -659,10 +661,10 @@ impl Region {
         }
 
         let mut merge = MergeBatchIter::new(sources, self.schema.clone());
-        let mut merged_batches: Vec<RecordBatch> = Vec::new();
+        let mut merged_batches: Vec<Arc<RecordBatch>> = Vec::new();
         loop {
             match merge.next_batch()? {
-                Some(batch) => merged_batches.push(batch),
+                Some(batch) => merged_batches.push(Arc::new(batch)),
                 None => break,
             }
         }
@@ -751,22 +753,23 @@ impl Region {
         let v = self.version.lock().unwrap().clone();
         let mut out = Vec::new();
         if v.active.len() > 0 {
-            out.push(Source::memtable(v.active.to_record_batch(&self.schema)?));
+            let batches = v.active.to_batches(&self.schema)?;
+            out.push(Source::memtable(batches));
         }
 
         for imm in v.immutables.iter().rev() {
             let ptr = Arc::as_ptr(imm) as *const () as usize;
-            let batch = {
+            let batches = {
                 let mut cache = self.immutable_batch_cache.lock().unwrap();
                 if let Some(b) = cache.get(&ptr) {
                     b.clone()
                 } else {
-                    let b = Arc::new(imm.to_record_batch(&self.schema)?);
+                    let b = Arc::new(imm.to_batches(&self.schema)?);
                     cache.insert(ptr, b.clone());
                     b
                 }
             };
-            out.push(Source::Memtable(Some(batch)));
+            out.push(Source::memtable((*batches).clone()));
         }
 
         for sst in v.ssts.iter().rev() {
@@ -850,7 +853,7 @@ mod tests {
         assert_eq!(region.get(k(1, 0)).unwrap(), Some(v("uno")));
 
         assert_eq!(region.delete(k(2, 0)).unwrap(), Some(v("two")));
-        assert_eq!(region.len(), 2);
+        assert_eq!(region.len(), 4);
         assert_eq!(region.get(k(2, 0)).unwrap(), None);
         assert_eq!(region.delete(k(3, 0)).unwrap(), None);
 

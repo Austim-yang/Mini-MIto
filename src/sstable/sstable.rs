@@ -384,11 +384,23 @@ impl SSTable {
     }
 
     pub fn create_from_batches(
-        batches: &[RecordBatch],
+        batches: &[Arc<RecordBatch>],
         id: usize,
         path: impl AsRef<Path>,
         schema: &TableSchema,
     ) -> io::Result<Self> {
+        let mut keyed: Vec<(Key, Arc<RecordBatch>)> = batches
+            .iter()
+            .filter(|b| b.num_rows() > 0)
+            .map(|b| {
+                let view = BatchView::new(b, schema);
+                (key_at(&view, schema, 0), (*b).clone())
+            })
+            .collect();
+        if keyed.windows(2).any(|w| w[0].0 > w[1].0) {
+            keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        let ordered: Vec<Arc<RecordBatch>> = keyed.into_iter().map(|(_, b)| b).collect();
         let seed = rand::random::<u64>();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         let mut bloom = BloomFilter::new(total_rows, 0.01, seed);
@@ -401,7 +413,7 @@ impl SSTable {
         let mut chunk_min_ts: Option<i64> = None;
         let mut chunk_max_ts: Option<i64> = None;
 
-        for batch in batches {
+        for batch in &ordered {
             let view = BatchView::new(batch, schema);
             for i in 0..batch.num_rows() {
                 let key = key_at(&view, schema, i);
@@ -455,7 +467,7 @@ impl SSTable {
         let mut writer = ArrowWriter::try_new(file, Arc::new(arrow_schema), Some(props))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        for batch in batches {
+        for batch in &ordered {
             writer
                 .write(batch)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -489,7 +501,7 @@ impl SSTable {
         let rows: Vec<(Key, u64, Option<Value>)> = skiplist.iter().collect();
         let mut batches = Vec::new();
         for chunk in rows.chunks(CHUNK_ROWS) {
-            batches.push(internal_batch_from_rows(chunk, schema)?);
+            batches.push(Arc::new(internal_batch_from_rows(chunk, schema)?));
         }
         Self::create_from_batches(&batches, id, path, schema)
     }
