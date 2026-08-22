@@ -3,7 +3,7 @@ use std::{hint::black_box, sync::Arc};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use mini_mito::{
     Key, Region, Value,
-    memtable::{SkipList, Wal, version::Source, wal::Operation},
+    memtable::{Wal, version::Source, wal::Operation},
     query::merge::MergeBatchIter,
     schema::TableSchema,
     sstable::sstable::SSTable,
@@ -18,29 +18,10 @@ fn value(i: u64) -> Value {
     format!("v{}", i).into_bytes()
 }
 
-fn build_skiplist(n: usize) -> SkipList {
-    let list = SkipList::new();
-    for i in 0..n {
-        list.insert(key(i as u64), i as u64, Some(value(i as u64)));
-    }
-    list
-}
-
-fn bench_skiplist_insert(c: &mut Criterion) {
-    let mut group = c.benchmark_group("skiplist_bulk_insert");
-    for size in [100, 500, 1000, 5000, 10000].iter() {
-        group.throughput(Throughput::Elements(*size as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
-            b.iter(|| {
-                let list = SkipList::new();
-                for i in 0..size {
-                    list.insert(key(i), i, Some(value(i)));
-                }
-                black_box(list);
-            });
-        });
-    }
-    group.finish();
+fn make_rows(n: usize) -> Vec<(Key, u64, Option<Value>)> {
+    (0..n)
+        .map(|i| (key(i as u64), i as u64, Some(value(i as u64))))
+        .collect()
 }
 
 fn bench_memtable_insert(c: &mut Criterion) {
@@ -69,12 +50,11 @@ fn bench_create_sstable(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(approx_bytes));
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
             b.iter(|| {
-                let list = build_skiplist(size);
+                let rows = make_rows(size);
                 let dir = tempdir().unwrap();
                 let path = dir.path().join("temp.sst");
-                let sst =
-                    SSTable::create_from_skiplist(&list, 0, &path, &TableSchema::default_table())
-                        .unwrap();
+                let sst = SSTable::create_from_rows(&rows, 0, &path, &TableSchema::default_table())
+                    .unwrap();
                 black_box(sst);
             });
         });
@@ -85,11 +65,11 @@ fn bench_create_sstable(c: &mut Criterion) {
 fn bench_sstable_scan(c: &mut Criterion) {
     let mut group = c.benchmark_group("sstable_scan");
     for size in [100, 500, 1000, 5000].iter() {
-        let list = build_skiplist(*size);
+        let rows = make_rows(*size);
         let dir = tempdir().unwrap();
         let path = dir.path().join("scan.sst");
         let sstable =
-            SSTable::create_from_skiplist(&list, 0, &path, &TableSchema::default_table()).unwrap();
+            SSTable::create_from_rows(&rows, 0, &path, &TableSchema::default_table()).unwrap();
         let min = sstable.min_key().clone();
         let max = sstable.max_key().clone();
 
@@ -118,21 +98,20 @@ fn bench_compaction(c: &mut Criterion) {
         let dir = tempdir().unwrap();
         let mut sstables = Vec::new();
         for id in 0..*num_ssts {
-            let list = SkipList::new();
             let start = id * per_sst_size;
-            for i in 0..per_sst_size {
-                let key = key((start + i) as u64);
-                let value = value((start + i) as u64);
-                list.insert(key, i, Some(value));
-            }
+            let rows: Vec<(Key, u64, Option<Value>)> = (0..per_sst_size)
+                .map(|i| {
+                    (
+                        key((start + i) as u64),
+                        i as u64,
+                        Some(value((start + i) as u64)),
+                    )
+                })
+                .collect();
             let path = dir.path().join(format!("{}.sst", id));
-            let sst = SSTable::create_from_skiplist(
-                &list,
-                id as usize,
-                &path,
-                &TableSchema::default_table(),
-            )
-            .unwrap();
+            let sst =
+                SSTable::create_from_rows(&rows, id as usize, &path, &TableSchema::default_table())
+                    .unwrap();
             sstables.push(sst);
         }
 
@@ -198,7 +177,6 @@ fn bench_wal_append_batch(c: &mut Criterion) {
 // ---------- 组合所有 benchmark ----------
 criterion_group!(
     benches,
-    bench_skiplist_insert,
     bench_memtable_insert,
     bench_create_sstable,
     bench_sstable_scan,

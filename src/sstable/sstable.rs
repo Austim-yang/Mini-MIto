@@ -21,7 +21,6 @@ use parquet::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    memtable::SkipList,
     schema::{BatchView, SemanticType, TableSchema, cells_to_array},
     sstable::bloom::BloomFilter,
     types::{Key, Value},
@@ -492,13 +491,12 @@ impl SSTable {
         })
     }
 
-    pub fn create_from_skiplist(
-        skiplist: &SkipList,
+    pub fn create_from_rows(
+        rows: &[(Key, u64, Option<Value>)],
         id: usize,
         path: impl AsRef<Path>,
         schema: &TableSchema,
     ) -> io::Result<Self> {
-        let rows: Vec<(Key, u64, Option<Value>)> = skiplist.iter().collect();
         let mut batches = Vec::new();
         for chunk in rows.chunks(CHUNK_ROWS) {
             batches.push(Arc::new(internal_batch_from_rows(chunk, schema)?));
@@ -771,7 +769,7 @@ impl Iterator for SSTableBatchIter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{memtable::SkipList, schema::ColumnDef};
+    use crate::schema::ColumnDef;
     use arrow_schema::DataType;
     use tempfile::tempdir;
 
@@ -820,13 +818,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.sst");
 
-        let skiplist = SkipList::new();
-        skiplist.insert(k(10, 0), 1, Some(v("ten")));
-        skiplist.insert(k(20, 0), 2, Some(v("twenty")));
-        skiplist.insert(k(30, 0), 3, Some(v("thirty")));
-
-        let sstable =
-            SSTable::create_from_skiplist(&skiplist, 1, &path, &TableSchema::default_table())?;
+        let rows = vec![
+            (k(10, 0), 1, Some(v("ten"))),
+            (k(20, 0), 2, Some(v("twenty"))),
+            (k(30, 0), 3, Some(v("thirty"))),
+        ];
+        let sstable = SSTable::create_from_rows(&rows, 1, &path, &TableSchema::default_table())?;
 
         assert_eq!(sstable.entry_count(), 3);
         assert_eq!(sstable.min_key(), &k(10, 0));
@@ -851,15 +848,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test_scan.sst");
 
-        let skiplist = SkipList::new();
-        skiplist.insert(k(10, 0), 1, Some(v("ten")));
-        skiplist.insert(k(20, 0), 2, Some(v("twenty")));
-        skiplist.insert(k(30, 0), 3, Some(v("thirty")));
-        skiplist.insert(k(40, 0), 4, Some(v("forty")));
-        skiplist.insert(k(50, 0), 5, Some(v("fifty")));
-
-        let sstable =
-            SSTable::create_from_skiplist(&skiplist, 1, &path, &TableSchema::default_table())?;
+        let rows = vec![
+            (k(10, 0), 1, Some(v("ten"))),
+            (k(20, 0), 2, Some(v("twenty"))),
+            (k(30, 0), 3, Some(v("thirty"))),
+            (k(40, 0), 4, Some(v("forty"))),
+            (k(50, 0), 5, Some(v("fifty"))),
+        ];
+        let sstable = SSTable::create_from_rows(&rows, 1, &path, &TableSchema::default_table())?;
 
         let result = scan_rows(
             &sstable,
@@ -917,12 +913,12 @@ mod tests {
     fn test_sstable_arrow_native_schema() -> io::Result<()> {
         let dir = tempdir().unwrap();
         let path = dir.path().join("native.sst");
-        let list = SkipList::new();
-        list.insert((vec![1], 100), 1, Some(v("a")));
-        list.insert((vec![1], 200), 2, None);
-        list.insert((vec![2], 100), 3, Some(v("b")));
-
-        SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table())?;
+        let rows = vec![
+            ((vec![1], 100), 1, Some(v("a"))),
+            ((vec![1], 200), 2, None),
+            ((vec![2], 100), 3, Some(v("b"))),
+        ];
+        SSTable::create_from_rows(&rows, 1, &path, &TableSchema::default_table())?;
 
         let file = File::open(&path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
@@ -958,10 +954,8 @@ mod tests {
     fn test_sstable_tombstone_roundtrip() -> io::Result<()> {
         let dir = tempdir().unwrap();
         let path = dir.path().join("1.sst");
-        let list = SkipList::new();
-        list.insert((vec![1], 10), 1, Some(v("a")));
-        list.insert((vec![1], 20), 2, None);
-        let sst = SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table())?;
+        let rows = vec![((vec![1], 10), 1, Some(v("a"))), ((vec![1], 20), 2, None)];
+        let sst = SSTable::create_from_rows(&rows, 1, &path, &TableSchema::default_table())?;
 
         assert_eq!(sst.get(&(vec![1], 20))?.unwrap().0, 2);
         assert_eq!(sst.get(&(vec![1], 20))?.unwrap().1, None);
@@ -984,15 +978,16 @@ mod tests {
     fn test_sstable_scan_iter() -> io::Result<()> {
         let dir = tempdir().unwrap();
         let path = dir.path().join("si.sst");
-        let list = SkipList::new();
-        for i in 0..10u64 {
-            list.insert(
-                (vec![i as u8], i as i64),
-                i + 1,
-                Some(v(&format!("v{}", i))),
-            );
-        }
-        let sst = SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table())?;
+        let rows: Vec<_> = (0..10u64)
+            .map(|i| {
+                (
+                    (vec![i as u8], i as i64),
+                    i + 1,
+                    Some(v(&format!("v{}", i))),
+                )
+            })
+            .collect();
+        let sst = SSTable::create_from_rows(&rows, 1, &path, &TableSchema::default_table())?;
         let got: Vec<_> = scan_rows(
             &sst,
             &(vec![3], 3),
@@ -1057,20 +1052,23 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("1.sst");
         let schema = schema3();
-        let list = SkipList::new();
         let rows = vec![
             cells(b"h1", b"cn", 100, 1, 2),
             cells(b"h1", b"cn", 200, 3, 4),
             cells(b"h2", b"us", 100, 5, 6),
         ];
-        for (i, c) in rows.iter().enumerate() {
-            list.insert(
-                schema.cells_to_key(c),
-                i as u64 + 1,
-                Some(schema.encode_fields(c)),
-            );
-        }
-        let sst = SSTable::create_from_skiplist(&list, 1, &path, &schema)?;
+        let kv: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                (
+                    schema.cells_to_key(c),
+                    i as u64 + 1,
+                    Some(schema.encode_fields(c)),
+                )
+            })
+            .collect();
+        let sst = SSTable::create_from_rows(&kv, 1, &path, &schema)?;
         let k = schema.cells_to_key(&rows[1]);
         assert_eq!(
             sst.get(&k)?.unwrap().1,
@@ -1156,11 +1154,10 @@ mod tests {
     fn test_sstable_multi_chunk_roundtrip() -> io::Result<()> {
         let dir = tempdir().unwrap();
         let path = dir.path().join("1.sst");
-        let list = SkipList::new();
-        for i in 0..20_000i64 {
-            list.insert((vec![0], i), i as u64 + 1, Some(v(&format!("v{}", i))));
-        }
-        let sst = SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table())?;
+        let rows: Vec<_> = (0..20_000i64)
+            .map(|i| ((vec![0], i), i as u64 + 1, Some(v(&format!("v{}", i)))))
+            .collect();
+        let sst = SSTable::create_from_rows(&rows, 1, &path, &TableSchema::default_table())?;
         assert_eq!(sst.entry_count(), 20_000);
         assert_eq!(sst.min_key(), &k(0, 0));
         assert_eq!(sst.max_key(), &k(0, 19_999));
@@ -1180,8 +1177,8 @@ mod tests {
     fn test_sstable_empty_skiplist() -> io::Result<()> {
         let dir = tempdir().unwrap();
         let path = dir.path().join("2.sst");
-        let list = SkipList::new();
-        let sst = SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table())?;
+        let rows: Vec<(Key, u64, Option<Value>)> = Vec::new();
+        let sst = SSTable::create_from_rows(&rows, 1, &path, &TableSchema::default_table())?;
         assert_eq!(sst.entry_count(), 0);
         assert_eq!(sst.max_seq(), 0);
 
@@ -1215,9 +1212,8 @@ mod tests {
     fn test_sstable_atomic_write_leaves_no_tmp() -> io::Result<()> {
         let dir = tempdir().unwrap();
         let path = dir.path().join("3.sst");
-        let list = SkipList::new();
-        list.insert(k(1, 0), 1, Some(v("a")));
-        SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table())?;
+        let rows = vec![(k(1, 0), 1, Some(v("a")))];
+        SSTable::create_from_rows(&rows, 1, &path, &TableSchema::default_table())?;
         assert!(path.exists());
         assert!(!dir.path().join("3.sst.tmp").exists());
         Ok(())
@@ -1227,11 +1223,10 @@ mod tests {
     fn test_sstable_scan_across_chunks() -> io::Result<()> {
         let dir = tempdir().unwrap();
         let path = dir.path().join("4.sst");
-        let list = SkipList::new();
-        for i in 0..20_000i64 {
-            list.insert((vec![0], i), i as u64 + 1, Some(v(&format!("v{}", i))));
-        }
-        let sst = SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table())?;
+        let rows: Vec<_> = (0..20_000i64)
+            .map(|i| ((vec![0], i), i as u64 + 1, Some(v(&format!("v{}", i)))))
+            .collect();
+        let sst = SSTable::create_from_rows(&rows, 1, &path, &TableSchema::default_table())?;
 
         let single = scan_rows(
             &sst,
@@ -1327,11 +1322,12 @@ mod tests {
     fn test_sstable_ts_pruning_multi_tag_sound() -> io::Result<()> {
         let dir = tempdir().unwrap();
         let path = dir.path().join("mt.sst");
-        let list = SkipList::new();
-        list.insert(k(10, 100), 1, Some(v("a")));
-        list.insert(k(20, 50), 2, Some(v("b")));
-        list.insert(k(20, 90), 3, Some(v("c")));
-        let sst = SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table())?;
+        let rows = vec![
+            (k(10, 100), 1, Some(v("a"))),
+            (k(20, 50), 2, Some(v("b"))),
+            (k(20, 90), 3, Some(v("c"))),
+        ];
+        let sst = SSTable::create_from_rows(&rows, 1, &path, &TableSchema::default_table())?;
         assert_eq!(sst.ts_extent(), Some((50, 100)));
 
         let got: Vec<_> = scan_rows(
@@ -1350,11 +1346,10 @@ mod tests {
     fn test_sstable_ts_pruning_row_groups() -> io::Result<()> {
         let dir = tempdir().unwrap();
         let path = dir.path().join("rg.sst");
-        let list = SkipList::new();
-        for i in 0..24_576i64 {
-            list.insert((vec![1], i), i as u64 + 1, Some(v(&format!("v{}", i))));
-        }
-        let sst = SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table())?;
+        let rows: Vec<_> = (0..24_576i64)
+            .map(|i| ((vec![1], i), i as u64 + 1, Some(v(&format!("v{}", i)))))
+            .collect();
+        let sst = SSTable::create_from_rows(&rows, 1, &path, &TableSchema::default_table())?;
         assert_eq!(sst.ts_extent(), Some((0, 24_575)));
 
         let got: Vec<_> = scan_rows(

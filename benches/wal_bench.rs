@@ -1,7 +1,7 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use mini_mito::memtable::{SkipList, Wal, wal::Operation};
+use mini_mito::memtable::{Wal, wal::Operation};
 use tempfile::tempdir;
 
 fn key(i: u64) -> (Vec<u8>, i64) {
@@ -64,18 +64,12 @@ fn bench_wal_recover(c: &mut Criterion) {
                 },
                 |(path, _dir)| {
                     let wal = Wal::new(&path).unwrap();
-                    let list = SkipList::new();
-                    wal.recover(&mut |op: &Operation| match op {
-                        Operation::Insert { key, seq, value }
-                        | Operation::Update { key, seq, value } => {
-                            list.insert(key.clone(), *seq, Some(value.clone()));
-                        }
-                        Operation::Delete { key, seq } => {
-                            list.insert(key.clone(), *seq, None);
-                        }
+                    let mut count = 0usize;
+                    wal.recover(&mut |_op: &Operation| {
+                        count += 1;
                     })
                     .unwrap();
-                    black_box(list.len());
+                    black_box(count);
                 },
                 criterion::BatchSize::SmallInput,
             );

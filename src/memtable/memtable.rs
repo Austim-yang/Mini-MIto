@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     memtable::{
-        SkipList, Wal,
+        Wal,
         columnar::ColumnarMemtable,
         traits::{ImmutableMemtable, Memtable},
         version::{Source, Version},
@@ -23,7 +23,7 @@ use crate::{
     },
     query::merge::MergeBatchIter,
     schema::{BatchView, SemanticType, TableSchema},
-    sstable::sstable::{SSTable, SstableIndex, internal_batch_from_rows, key_at, value_at},
+    sstable::sstable::{SSTable, SstableIndex, key_at, value_at},
     types::{Key, Value},
 };
 
@@ -34,166 +34,6 @@ pub struct ManifestEntry {
     min_key: Key,
     max_key: Key,
     entry_count: usize,
-}
-
-pub struct MutableSkipListMemtable {
-    inner: Arc<SkipList>,
-    wal: Arc<Mutex<Wal>>,
-    wal_path: PathBuf,
-}
-
-impl Memtable for MutableSkipListMemtable {
-    fn write(&self, key: Key, seq: u64, value: Option<Value>) -> io::Result<Option<Value>> {
-        let op = match &value {
-            Some(v) => Operation::Insert {
-                key: key.clone(),
-                seq,
-                value: v.clone(),
-            },
-            None => Operation::Delete {
-                key: key.clone(),
-                seq,
-            },
-        };
-        self.wal.lock().unwrap().append(&op)?;
-        Ok(self.inner.insert(key, seq, value))
-    }
-
-    fn write_batch(&self, entries: Vec<(Key, u64, Option<Value>)>) -> io::Result<()> {
-        let mut wal_guard = self.wal.lock().unwrap();
-        for (key, seq, value) in &entries {
-            let op = match value {
-                Some(v) => Operation::Insert {
-                    key: key.clone(),
-                    seq: *seq,
-                    value: v.clone(),
-                },
-                None => Operation::Delete {
-                    key: key.clone(),
-                    seq: *seq,
-                },
-            };
-            wal_guard.append(&op)?;
-        }
-        for (key, seq, value) in entries {
-            self.inner.insert(key, seq, value);
-        }
-        Ok(())
-    }
-
-    fn replay(&self, op: &Operation) -> io::Result<()> {
-        match op {
-            Operation::Insert { key, seq, value } | Operation::Update { key, seq, value } => {
-                self.inner.insert(key.clone(), *seq, Some(value.clone()));
-            }
-            Operation::Delete { key, seq } => {
-                self.inner.insert(key.clone(), *seq, None);
-            }
-        }
-        Ok(())
-    }
-
-    fn get(&self, key: &Key) -> io::Result<Option<(u64, Option<Value>)>> {
-        Ok(self.inner.get(key))
-    }
-
-    fn max_seq(&self) -> u64 {
-        self.inner.max_seq()
-    }
-
-    fn to_batches(&self, schema: &TableSchema) -> io::Result<Vec<Arc<RecordBatch>>> {
-        let rows: Vec<(Key, u64, Option<Value>)> = self.inner.iter().collect();
-        Ok(vec![Arc::new(internal_batch_from_rows(&rows, schema)?)])
-    }
-
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    fn estimated_size(&self) -> usize {
-        self.inner.len() * 64
-    }
-
-    fn freeze(&self) -> io::Result<Box<dyn ImmutableMemtable>> {
-        self.wal.lock().unwrap().close()?;
-        Ok(Box::new(ImmutableSkipListMemtable {
-            inner: self.inner.clone(),
-            wal_path: self.wal_path.clone(),
-        }))
-    }
-
-    fn fork(&self) -> io::Result<Box<dyn Memtable>> {
-        let parent = self.wal_path.parent().unwrap();
-        let stem = self.wal_path.file_stem().unwrap().to_str().unwrap();
-        let seq: usize = stem.trim_start_matches("wal_").parse().unwrap_or(0);
-        let new_seq = seq + 1;
-        let new_path = parent.join(format!("wal_{:03}.log", new_seq));
-        Ok(Box::new(MutableSkipListMemtable::new(new_path)?))
-    }
-
-    fn close(&self) -> io::Result<()> {
-        self.wal.lock().unwrap().close()
-    }
-}
-
-impl MutableSkipListMemtable {
-    fn new(wal_path: PathBuf) -> io::Result<Self> {
-        let wal = Wal::new(&wal_path)?;
-        let mem = Self {
-            inner: Arc::new(SkipList::new()),
-            wal: Arc::new(Mutex::new(wal)),
-            wal_path,
-        };
-        {
-            let wal = mem.wal.lock().unwrap();
-            wal.recover(&mut |op: &Operation| {
-                let _ = mem.replay(op);
-            })?;
-        }
-        Ok(mem)
-    }
-}
-
-use std::fmt;
-
-impl fmt::Debug for MutableSkipListMemtable {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Memtable")
-            .field("wal_path", &self.wal_path)
-            .finish()
-    }
-}
-
-pub struct ImmutableSkipListMemtable {
-    inner: Arc<SkipList>,
-    wal_path: PathBuf,
-}
-
-impl ImmutableMemtable for ImmutableSkipListMemtable {
-    fn get(&self, key: &Key) -> io::Result<Option<(u64, Option<Value>)>> {
-        Ok(self.inner.get(key))
-    }
-
-    fn max_seq(&self) -> u64 {
-        self.inner.max_seq()
-    }
-
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    fn estimated_size(&self) -> usize {
-        self.inner.len() * 64
-    }
-
-    fn to_batches(&self, schema: &TableSchema) -> io::Result<Vec<Arc<RecordBatch>>> {
-        let rows: Vec<(Key, u64, Option<Value>)> = self.inner.iter().collect();
-        Ok(vec![Arc::new(internal_batch_from_rows(&rows, schema)?)])
-    }
-
-    fn wal_path(&self) -> &Path {
-        &self.wal_path
-    }
 }
 
 pub struct Region {
@@ -275,7 +115,7 @@ impl Region {
         };
         region.merge_orphan_wals(&wal_files, active.as_ref())?;
 
-        let watermark = { 
+        let watermark = {
             let mut w = 0u64;
             w = w.max(active.max_seq());
             for sst in ssts.iter() {
@@ -304,20 +144,25 @@ impl Region {
     fn merge_orphan_wals(&self, wal_files: &[PathBuf], active: &dyn Memtable) -> io::Result<()> {
         for path in wal_files {
             let wal = Wal::new(path)?;
-            let skiplist = SkipList::new();
-            wal.recover(&mut |op: &Operation| match op {
-                Operation::Insert { key, seq, value } | Operation::Update { key, seq, value } => {
-                    skiplist.insert(key.clone(), *seq, Some(value.clone()));
-                }
-                Operation::Delete { key, seq } => {
-                    skiplist.insert(key.clone(), *seq, None);
+            let mut latest: HashMap<Key, (u64, Option<Value>)> = HashMap::new();
+            wal.recover(&mut |op: &Operation| {
+                let (key, seq, value) = match op {
+                    Operation::Insert { key, seq, value }
+                    | Operation::Update { key, seq, value } => (key, *seq, Some(value.clone())),
+                    Operation::Delete { key, seq } => (key, *seq, None),
+                };
+                match latest.get_mut(key) {
+                    Some(e) if e.0 >= seq => {}
+                    _ => {
+                        latest.insert(key.clone(), (seq, value));
+                    }
                 }
             })?;
-            if skiplist.is_empty() {
+            if latest.is_empty() {
                 let _ = fs::remove_file(path);
                 continue;
             }
-            for (key, seq, value) in skiplist.iter() {
+            for (key, (seq, value)) in latest {
                 match active.get(&key)? {
                     Some((s, _)) if s >= seq => {}
                     _ => {

@@ -1,15 +1,20 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use mini_mito::{memtable::SkipList, schema::TableSchema, sstable::sstable::SSTable};
+use mini_mito::{Key, schema::TableSchema, sstable::sstable::SSTable};
 use rand::{RngExt, rng};
 use tempfile::tempdir;
 
 fn key(i: u64) -> (Vec<u8>, i64) {
     (vec![i as u8], i as i64)
 }
+
 fn value(i: u64) -> Vec<u8> {
     format!("v{}", i).into_bytes()
+}
+
+fn make_rows(n: u64) -> Vec<(Key, u64, Option<Vec<u8>>)> {
+    (0..n).map(|i| (key(i), i, Some(value(i)))).collect()
 }
 
 fn bench_sstable_create(c: &mut Criterion) {
@@ -17,22 +22,12 @@ fn bench_sstable_create(c: &mut Criterion) {
     for size in [1_000, 10_000, 100_000].iter() {
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
             b.iter_batched(
-                || {
-                    let list = SkipList::new();
-                    for i in 0..size {
-                        list.insert(key(i), i, Some(value(i)));
-                    }
-                    (list, tempdir().unwrap())
-                },
-                |(list, dir)| {
+                || (make_rows(size), tempdir().unwrap()),
+                |(rows, dir)| {
                     let path = dir.path().join("test.sst");
-                    let _ = SSTable::create_from_skiplist(
-                        &list,
-                        1,
-                        &path,
-                        &TableSchema::default_table(),
-                    )
-                    .unwrap();
+                    let _ =
+                        SSTable::create_from_rows(&rows, 1, &path, &TableSchema::default_table())
+                            .unwrap();
                 },
                 criterion::BatchSize::SmallInput,
             );
@@ -43,14 +38,10 @@ fn bench_sstable_create(c: &mut Criterion) {
 
 fn bench_sstable_get(c: &mut Criterion) {
     let size = 10_000;
-    let list = SkipList::new();
-    for i in 0..size {
-        list.insert(key(i), i, Some(value(i)));
-    }
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.sst");
-    let sst =
-        SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table()).unwrap();
+    let sst = SSTable::create_from_rows(&make_rows(size), 1, &path, &TableSchema::default_table())
+        .unwrap();
     let mut rng = rng();
 
     c.bench_function("sstable_get_hit", |b| {
@@ -69,14 +60,10 @@ fn bench_sstable_get(c: &mut Criterion) {
 
 fn bench_sstable_scan(c: &mut Criterion) {
     let size = 10_000;
-    let list = SkipList::new();
-    for i in 0..size {
-        list.insert(key(i), i, Some(value(i)));
-    }
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.sst");
-    let sst =
-        SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table()).unwrap();
+    let sst = SSTable::create_from_rows(&make_rows(size), 1, &path, &TableSchema::default_table())
+        .unwrap();
 
     c.bench_function("sstable_scan_all", |b| {
         b.iter(|| {
@@ -105,14 +92,10 @@ fn bench_sstable_scan(c: &mut Criterion) {
 
 fn bench_sstable_scan_time_range(c: &mut Criterion) {
     let size: u64 = 100_000;
-    let list = SkipList::new();
-    for i in 0..size {
-        list.insert(key(i), i, Some(value(i)));
-    }
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.sst");
-    let sst =
-        SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table()).unwrap();
+    let sst = SSTable::create_from_rows(&make_rows(size), 1, &path, &TableSchema::default_table())
+        .unwrap();
     let min = sst.min_key().clone();
     let max = sst.max_key().clone();
 
@@ -140,14 +123,10 @@ fn bench_sstable_scan_time_range(c: &mut Criterion) {
 
 fn bench_sstable_get_100k(c: &mut Criterion) {
     let size: u64 = 100_000;
-    let list = SkipList::new();
-    for i in 0..size {
-        list.insert(key(i), i, Some(value(i)));
-    }
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.sst");
-    let sst =
-        SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table()).unwrap();
+    let sst = SSTable::create_from_rows(&make_rows(size), 1, &path, &TableSchema::default_table())
+        .unwrap();
     let mut rng = rng();
 
     c.bench_function("sstable_get_hit_100k", |b| {
@@ -166,14 +145,10 @@ fn bench_sstable_get_100k(c: &mut Criterion) {
 
 fn bench_sstable_scan_100k(c: &mut Criterion) {
     let size: u64 = 100_000;
-    let list = SkipList::new();
-    for i in 0..size {
-        list.insert(key(i), i, Some(value(i)));
-    }
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.sst");
-    let sst =
-        SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table()).unwrap();
+    let sst = SSTable::create_from_rows(&make_rows(size), 1, &path, &TableSchema::default_table())
+        .unwrap();
 
     c.bench_function("sstable_scan_all_100k", |b| {
         b.iter(|| {

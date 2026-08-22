@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 arrow = "^58.3.0"
 arrow-schema = "^58.3.0"
-crossbeam-skiplist = "0.1.3"
 datafusion = "54.0.0"
 futures = "0.3.33"
 parquet = "^58.3.0"
@@ -27,10 +26,6 @@ bench = false
 name = "mini_mito"
 path = "src/main.rs"
 bench = false
-
-[[bench]]
-name = "skiplist_bench"
-harness = false
 
 [[bench]]
 name = "wal_bench"

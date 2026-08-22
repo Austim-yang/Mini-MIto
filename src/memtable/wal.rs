@@ -69,8 +69,10 @@ impl Wal {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
-    use crate::memtable::SkipList;
+
     use tempfile::tempdir;
 
     fn k(tag: u8, ts: i64) -> Key {
@@ -80,13 +82,25 @@ mod tests {
         s.as_bytes().to_vec()
     }
 
-    fn replay_into(list: &SkipList) -> impl FnMut(&Operation) + '_ {
+    #[derive(Default)]
+    struct Rows(BTreeMap<Key, (u64, Option<Value>)>);
+
+    impl Rows {
+        fn insert(&mut self, key: Key, seq: u64, value: Option<Value>) {
+            self.0.insert(key, (seq, value));
+        }
+        fn get(&self, key: &Key) -> Option<(u64, Option<Value>)> {
+            self.0.get(key).cloned()
+        }
+    }
+
+    fn replay_into(rows: &mut Rows) -> impl FnMut(&Operation) + '_ {
         move |op: &Operation| match op {
             Operation::Insert { key, seq, value } | Operation::Update { key, seq, value } => {
-                list.insert(key.clone(), *seq, Some(value.clone()));
+                rows.insert(key.clone(), *seq, Some(value.clone()));
             }
             Operation::Delete { key, seq } => {
-                list.insert(key.clone(), *seq, None);
+                rows.insert(key.clone(), *seq, None);
             }
         }
     }
@@ -111,13 +125,13 @@ mod tests {
         .unwrap();
         wal.close().unwrap();
 
-        let list = SkipList::new();
+        let mut rows = Rows::default();
         let wal_recover = Wal::new(&path).unwrap();
-        wal_recover.recover(&mut replay_into(&list)).unwrap();
+        wal_recover.recover(&mut replay_into(&mut rows)).unwrap();
 
-        assert_eq!(list.get(&k(1, 0)), Some((1, Some(v("one")))));
-        assert_eq!(list.get(&k(2, 0)), Some((2, Some(v("two")))));
-        assert_eq!(list.len(), 2);
+        assert_eq!(rows.get(&k(1, 0)), Some((1, Some(v("one")))));
+        assert_eq!(rows.get(&k(2, 0)), Some((2, Some(v("two")))));
+        assert_eq!(rows.0.len(), 2);
     }
 
     #[test]
@@ -145,12 +159,12 @@ mod tests {
         .unwrap();
         wal.close().unwrap();
 
-        let list = SkipList::new();
+        let mut rows = Rows::default();
         let wal_recover = Wal::new(&path).unwrap();
-        wal_recover.recover(&mut replay_into(&list)).unwrap();
+        wal_recover.recover(&mut replay_into(&mut rows)).unwrap();
 
-        assert_eq!(list.get(&k(10, 0)), Some((3, None)));
-        assert_eq!(list.len(), 1);
+        assert_eq!(rows.get(&k(10, 0)), Some((3, None)));
+        assert_eq!(rows.0.len(), 1);
     }
 
     #[test]
@@ -159,10 +173,10 @@ mod tests {
         let path = dir.path().join("empty.log");
         Wal::new(&path).unwrap().close().unwrap();
 
-        let list = SkipList::new();
+        let mut rows = Rows::default();
         let wal = Wal::new(&path).unwrap();
-        wal.recover(&mut replay_into(&list)).unwrap();
-        assert_eq!(list.len(), 0);
+        wal.recover(&mut replay_into(&mut rows)).unwrap();
+        assert_eq!(rows.0.len(), 0);
     }
 
     #[test]
@@ -183,10 +197,11 @@ mod tests {
         .unwrap();
         wal.close().unwrap();
 
-        let list = SkipList::new();
+        let mut rows = Rows::default();
         let wal_recover = Wal::new(&path).unwrap();
-        wal_recover.recover(&mut replay_into(&list)).unwrap();
-        assert_eq!(list.get(&k(1, 0)), Some((43, None)));
-        assert_eq!(list.max_seq(), 43);
+        wal_recover.recover(&mut replay_into(&mut rows)).unwrap();
+        assert_eq!(rows.get(&k(1, 0)), Some((43, None)));
+        let max_seq = rows.0.values().map(|(s, _)| *s).max();
+        assert_eq!(max_seq, Some(43));
     }
 }
