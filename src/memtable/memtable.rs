@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs::{self},
     io::{self, BufRead, Write},
     path::{Path, PathBuf},
@@ -10,18 +10,16 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use arrow::array::RecordBatch;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     memtable::{
         SkipList, Wal,
         traits::{ImmutableMemtable, Memtable},
-        version::Version,
+        version::{Source, Version},
         wal::Operation,
-    },
-    schema::TableSchema,
-    sstable::sstable::{SSTable, SstableIndex},
-    types::{Key, Value},
+    }, query::merge::MergeBatchIter, schema::{BatchView, SemanticType, TableSchema}, sstable::sstable::{SSTable, SstableIndex, internal_batch_from_rows, key_at, value_at}, types::{Key, Value},
 };
 
 #[derive(Serialize, Deserialize)]
@@ -98,18 +96,9 @@ impl Memtable for MutableSkipListMemtable {
         self.inner.max_seq()
     }
 
-    fn scan(&self, start: &Key, end: &Key) -> io::Result<Vec<(Key, u64, Option<Value>)>> {
-        let mut results = Vec::new();
-        for (k, seq, v) in self.inner.iter() {
-            if &k >= start && &k <= end {
-                results.push((k, seq, v));
-            }
-        }
-        Ok(results)
-    }
-
-    fn iter(&self) -> Box<dyn Iterator<Item = (Key, u64, Option<Value>)> + '_> {
-        Box::new(self.inner.iter())
+    fn to_record_batch(&self, schema: &TableSchema) -> io::Result<RecordBatch> {
+        let rows: Vec<(Key, u64, Option<Value>)> = self.inner.iter().collect();
+        internal_batch_from_rows(&rows, schema)
     }
 
     fn len(&self) -> usize {
@@ -184,20 +173,6 @@ impl ImmutableMemtable for ImmutableSkipListMemtable {
         self.inner.max_seq()
     }
 
-    fn scan(&self, start: &Key, end: &Key) -> io::Result<Vec<(Key, u64, Option<Value>)>> {
-        let mut results = Vec::new();
-        for (k, seq, v) in self.inner.iter() {
-            if &k >= start && &k <= end {
-                results.push((k, seq, v));
-            }
-        }
-        Ok(results)
-    }
-
-    fn iter(&self) -> Box<dyn Iterator<Item = (Key, u64, Option<Value>)> + '_> {
-        Box::new(self.inner.iter())
-    }
-
     fn len(&self) -> usize {
         self.inner.len()
     }
@@ -206,8 +181,9 @@ impl ImmutableMemtable for ImmutableSkipListMemtable {
         self.inner.len() * 64
     }
 
-    fn to_sstable(&self, id: usize, path: &Path, schema: &TableSchema) -> io::Result<SSTable> {
-        SSTable::create_from_skiplist(&self.inner, id, path, true, schema)
+    fn to_record_batch(&self, schema: &TableSchema) -> io::Result<RecordBatch> {
+        let rows: Vec<(Key, u64, Option<Value>)> = self.inner.iter().collect();
+        internal_batch_from_rows(&rows, schema)
     }
 
     fn wal_path(&self) -> &Path {
@@ -229,6 +205,7 @@ pub struct Region {
     ttl: Option<i64>,
     window_size: i64,
     compact_threshold: usize,
+    immutable_batch_cache: Mutex<HashMap<usize, Arc<RecordBatch>>>,
 }
 
 impl Region {
@@ -264,6 +241,7 @@ impl Region {
             ttl: None,
             window_size: 3_600_000_000_000,
             compact_threshold: 4,
+            immutable_batch_cache: Mutex::new(HashMap::new()),
         };
         let mut ssts: Vec<SSTable> = Vec::new();
         region.load_manifest(&mut ssts)?;
@@ -616,7 +594,13 @@ impl Region {
         for imm in v.immutables.iter() {
             let id = self.sst_id.load(Ordering::SeqCst);
             let path = self.base_dir.join(format!("{:04}.sst", id));
-            let sst = imm.to_sstable(id, &path, &self.schema)?;
+            let batch = imm.to_record_batch(&self.schema)?;
+            let sst = SSTable::create_from_batches(
+                std::slice::from_ref(&batch),
+                id,
+                &path,
+                &self.schema,
+            )?;
             self.sst_id.fetch_add(1, Ordering::SeqCst);
             new_ssts.push(sst);
             flushed_wals.push(imm.wal_path().to_path_buf());
@@ -663,14 +647,26 @@ impl Region {
         };
 
         let old_paths: Vec<PathBuf> = target.iter().map(|&i| v.ssts[i].path().clone()).collect();
-        let merged_skiplist = SkipList::new();
         let clamp = cutoff.map(|c| (c, i64::MAX));
+        let mut sources = Vec::with_capacity(target.len());
         for &i in target {
             let sst = &v.ssts[i];
-            for (k, seq, v) in sst.scan_iter_with_range(sst.min_key(), sst.max_key(), clamp)? {
-                merged_skiplist.insert(k, seq, v);
+            sources.push(Source::Sst(sst.scan_batches(
+                sst.min_key(),
+                sst.max_key(),
+                clamp,
+            )?));
+        }
+
+        let mut merge = MergeBatchIter::new(sources, self.schema.clone());
+        let mut merged_batches: Vec<RecordBatch> = Vec::new();
+        loop {
+            match merge.next_batch()? {
+                Some(batch) => merged_batches.push(batch),
+                None => break,
             }
         }
+
         let mut ssts: Vec<SSTable> = v
             .ssts
             .iter()
@@ -678,11 +674,10 @@ impl Region {
             .filter(|(i, _)| !target.contains(i))
             .map(|(_, s)| s.clone())
             .collect();
-        if merged_skiplist.len() > 0 {
+        if !merged_batches.is_empty() {
             let id = self.sst_id.load(Ordering::SeqCst);
             let path = self.base_dir.join(format!("{:04}.sst", id));
-            let new_sst =
-                SSTable::create_from_skiplist(&merged_skiplist, id, &path, true, &self.schema)?;
+            let new_sst = SSTable::create_from_batches(&merged_batches, id, &path, &self.schema)?;
             self.sst_id.fetch_add(1, Ordering::SeqCst);
             ssts.push(new_sst);
         }
@@ -720,62 +715,77 @@ impl Region {
         self.version.lock().unwrap().clone().ssts.clone()
     }
 
-    pub fn iter_all_data(&self) -> io::Result<impl Iterator<Item = (Key, Option<Value>)> + '_> {
-        use std::collections::BTreeMap;
-        let v = self.version.lock().unwrap().clone();
+    pub fn iter_all_data(&self) -> io::Result<impl Iterator<Item = (Key, Option<Value>)>> {
+        let sources = self.snapshot_columnar_sources(None)?;
+        let schema = Arc::new(TableSchema::clone(&self.schema));
         let mut map: BTreeMap<Key, (u64, Option<Value>)> = BTreeMap::new();
-        for sst in v.ssts.iter().rev() {
-            for (k, seq, v) in sst.scan(sst.min_key(), sst.max_key())? {
-                map.entry(k)
-                    .and_modify(|(s, cur)| {
-                        if seq > *s {
-                            *s = seq;
-                            *cur = v.clone();
-                        }
-                    })
-                    .or_insert((seq, v));
+        let field_cols: Vec<usize> = schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.semantic == SemanticType::Field)
+            .map(|(c, _)| c)
+            .collect();
+        for mut src in sources {
+            while let Some(batch) = src.next_batch()? {
+                let view = BatchView::new(&batch, &schema);
+                for i in 0..batch.num_rows() {
+                    let k = key_at(&view, &schema, i);
+                    let seq = view.seq_value(i) as u64;
+                    let value = value_at(&view, &schema, &field_cols, i);
+                    map.entry(k)
+                        .and_modify(|(s, cur)| {
+                            if seq > *s {
+                                *s = seq;
+                                *cur = value.clone();
+                            }
+                        })
+                        .or_insert((seq, value));
+                }
             }
-        }
-        for imm in v.immutables.iter().rev() {
-            for (k, seq, v) in imm.iter() {
-                map.entry(k)
-                    .and_modify(|(s, cur)| {
-                        if seq > *s {
-                            *s = seq;
-                            *cur = v.clone();
-                        }
-                    })
-                    .or_insert((seq, v));
-            }
-        }
-        for (k, seq, v) in v.active.iter() {
-            map.entry(k)
-                .and_modify(|(s, cur)| {
-                    if seq > *s {
-                        *s = seq;
-                        *cur = v.clone();
-                    }
-                })
-                .or_insert((seq, v));
         }
         Ok(map.into_iter().map(|(k, (_, value))| (k, value)))
     }
 
-    pub fn snapshot_sources(
-        &self,
-    ) -> io::Result<Vec<Box<dyn Iterator<Item = (Key, u64, Option<Value>)>>>> {
-        self.version.lock().unwrap().clone().sources()
-    }
+    pub fn snapshot_columnar_sources(&self, bounds: Option<(i64, i64)>) -> io::Result<Vec<Source>> {
+        let v = self.version.lock().unwrap().clone();
+        let mut out = Vec::new();
+        if v.active.len() > 0 {
+            out.push(Source::memtable(v.active.to_record_batch(&self.schema)?));
+        }
 
-    pub fn snapshot_sources_with_range(
-        &self,
-        bounds: (i64, i64),
-    ) -> io::Result<Vec<Box<dyn Iterator<Item = (Key, u64, Option<Value>)>>>> {
-        self.version
-            .lock()
-            .unwrap()
-            .clone()
-            .sources_with_range(bounds)
+        for imm in v.immutables.iter().rev() {
+            let ptr = Arc::as_ptr(imm) as *const () as usize;
+            let batch = {
+                let mut cache = self.immutable_batch_cache.lock().unwrap();
+                if let Some(b) = cache.get(&ptr) {
+                    b.clone()
+                } else {
+                    let b = Arc::new(imm.to_record_batch(&self.schema)?);
+                    cache.insert(ptr, b.clone());
+                    b
+                }
+            };
+            out.push(Source::Memtable(Some(batch)));
+        }
+
+        for sst in v.ssts.iter().rev() {
+            let overlaps = bounds.map_or(true, |(low, high)| {
+                sst.ts_extent()
+                    .map_or(true, |(s_low, s_high)| s_high >= low && s_low <= high)
+            });
+            if !overlaps {
+                continue;
+            }
+            let ts_range = bounds.filter(|&(low, high)| !(low == i64::MIN && high == i64::MAX));
+            out.push(Source::Sst(sst.scan_batches(
+                sst.min_key(),
+                sst.max_key(),
+                ts_range,
+            )?));
+        }
+
+        Ok(out)
     }
 
     pub fn close(&self) -> io::Result<()> {
@@ -1224,7 +1234,7 @@ mod tests {
             )?;
         }
 
-        let snapshot = region.snapshot_sources()?;
+        let snapshot = region.snapshot_columnar_sources(None)?;
         let flusher = {
             let region = region.clone();
             std::thread::spawn(move || {
@@ -1235,9 +1245,13 @@ mod tests {
         };
 
         let mut seen = std::collections::HashSet::new();
-        for src in snapshot {
-            for (key, _, _) in src {
-                seen.insert(key);
+        let schema = TableSchema::default_table();
+        for mut src in snapshot {
+            while let Some(batch) = src.next_batch()? {
+                let view = BatchView::new(&batch, &schema);
+                for i in 0..batch.num_rows() {
+                    seen.insert(key_at(&view, &schema, i));
+                }
             }
         }
         flusher.join().unwrap();
@@ -1300,11 +1314,25 @@ mod tests {
         }
         region.flush()?;
 
-        let sources = region.snapshot_sources_with_range((5000, 5100))?;
+        let sources = region.snapshot_columnar_sources(Some((5000, 5100)))?;
         let mut rows = Vec::new();
-        for src in sources {
-            for (key, _, value) in src {
-                rows.push((key, value));
+        let schema = TableSchema::default_table();
+        let field_cols: Vec<usize> = schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.semantic == SemanticType::Field)
+            .map(|(c, _)| c)
+            .collect();
+        for mut src in sources {
+            while let Some(batch) = src.next_batch()? {
+                let view = BatchView::new(&batch, &schema);
+                for i in 0..batch.num_rows() {
+                    rows.push((
+                        key_at(&view, &schema, i),
+                        value_at(&view, &schema, &field_cols, i),
+                    ));
+                }
             }
         }
         assert_eq!(rows.len(), 101);
@@ -1408,10 +1436,15 @@ mod tests {
         region.compact()?;
         assert_eq!(region.get(k(2, expired))?, None);
         let mut found = false;
+        let schema = TableSchema::default_table();
         for sst in region.get_immutable_ssts() {
-            for (key, _, _) in sst.scan(sst.min_key(), sst.max_key())? {
-                if key == k(2, expired) {
-                    found = true;
+            for batch in sst.scan_batches(sst.min_key(), sst.max_key(), None)? {
+                let batch = batch?;
+                let view = BatchView::new(&batch, &schema);
+                for i in 0..batch.num_rows() {
+                    if key_at(&view, &schema, i) == k(2, expired) {
+                        found = true;
+                    }
                 }
             }
         }

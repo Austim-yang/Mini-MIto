@@ -8,7 +8,10 @@ use std::{
     vec,
 };
 
-use arrow::array::{ArrayRef, Int8Array, Int64Array, RecordBatch};
+use arrow::{
+    array::{ArrayRef, BooleanArray, Int8Array, Int64Array, RecordBatch},
+    compute::filter_record_batch,
+};
 use arrow_schema::{DataType, Field, Schema};
 use base64::Engine;
 use parquet::{
@@ -24,13 +27,13 @@ use crate::{
     types::{Key, Value},
 };
 
-const CHUNK_ROWS: usize = 8192;
+pub(crate) const CHUNK_ROWS: usize = 8192;
 const INDEX_META_KEY: &str = "sstable.index";
 const INDEX_VERSION: u32 = 3;
-const SEQ_COL: &str = "__seq";
-const OP_COL: &str = "__op_type";
-const OP_PUT: i8 = 0;
-const OP_DELETE: i8 = 1;
+pub(crate) const SEQ_COL: &str = "__seq";
+pub(crate) const OP_COL: &str = "__op_type";
+pub(crate) const OP_PUT: i8 = 0;
+pub(crate) const OP_DELETE: i8 = 1;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RowGroupMeta {
@@ -226,7 +229,7 @@ fn from_hex(s: &str) -> io::Result<Vec<u8>> {
     Ok(result)
 }
 
-fn key_at(view: &BatchView, schema: &TableSchema, i: usize) -> Key {
+pub(crate) fn key_at(view: &BatchView, schema: &TableSchema, i: usize) -> Key {
     let tags = if schema.primary_key.len() == 1 {
         view.cell(schema.primary_key[0], i).unwrap_or_default()
     } else {
@@ -240,7 +243,7 @@ fn key_at(view: &BatchView, schema: &TableSchema, i: usize) -> Key {
     (tags, ts)
 }
 
-fn value_at(
+pub(crate) fn value_at(
     view: &BatchView,
     schema: &TableSchema,
     field_cols: &[usize],
@@ -265,7 +268,7 @@ fn value_at(
     Some(schema.encode_fields(&cells))
 }
 
-fn sst_schema(schema: &TableSchema) -> Schema {
+pub(crate) fn sst_schema(schema: &TableSchema) -> Schema {
     let mut fields: Vec<Field> = schema
         .arrow_schema()
         .fields()
@@ -277,7 +280,7 @@ fn sst_schema(schema: &TableSchema) -> Schema {
     Schema::new(fields)
 }
 
-fn build_batch(
+pub(crate) fn internal_batch_from_rows(
     rows: &[(Key, u64, Option<Value>)],
     schema: &TableSchema,
 ) -> io::Result<RecordBatch> {
@@ -380,15 +383,15 @@ impl SSTable {
         }
     }
 
-    pub fn create_from_skiplist(
-        skiplist: &SkipList,
+    pub fn create_from_batches(
+        batches: &[RecordBatch],
         id: usize,
         path: impl AsRef<Path>,
-        include_tombstones: bool,
         schema: &TableSchema,
     ) -> io::Result<Self> {
         let seed = rand::random::<u64>();
-        let mut bloom = BloomFilter::new(skiplist.len(), 0.01, seed);
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let mut bloom = BloomFilter::new(total_rows, 0.01, seed);
 
         let mut row_groups: Vec<RowGroupMeta> = Vec::new();
         let mut max_seq: u64 = 0;
@@ -398,29 +401,30 @@ impl SSTable {
         let mut chunk_min_ts: Option<i64> = None;
         let mut chunk_max_ts: Option<i64> = None;
 
-        for (key, seq, value) in skiplist.iter() {
-            if !include_tombstones && value.is_none() {
-                continue;
-            }
+        for batch in batches {
+            let view = BatchView::new(batch, schema);
+            for i in 0..batch.num_rows() {
+                let key = key_at(&view, schema, i);
 
-            max_seq = max_seq.max(seq);
-            bloom.insert(&key);
-            if chunk_min.is_none() {
-                chunk_min = Some(key.clone());
-            }
-            chunk_max = Some(key.clone());
-            chunk_min_ts = Some(chunk_min_ts.map_or(key.1, |t| t.min(key.1)));
-            chunk_max_ts = Some(chunk_max_ts.map_or(key.1, |t| t.max(key.1)));
-            chunk_rows += 1;
-            if chunk_rows == CHUNK_ROWS {
-                row_groups.push(RowGroupMeta {
-                    num_rows: chunk_rows,
-                    min_key: chunk_min.take().unwrap(),
-                    max_key: chunk_max.take().unwrap(),
-                    min_ts: chunk_min_ts.take().unwrap(),
-                    max_ts: chunk_max_ts.take().unwrap(),
-                });
-                chunk_rows = 0;
+                max_seq = max_seq.max(view.seq_value(i) as u64);
+                bloom.insert(&key);
+                if chunk_min.is_none() {
+                    chunk_min = Some(key.clone());
+                }
+                chunk_max = Some(key.clone());
+                chunk_min_ts = Some(chunk_min_ts.map_or(key.1, |t| t.min(key.1)));
+                chunk_max_ts = Some(chunk_max_ts.map_or(key.1, |t| t.max(key.1)));
+                chunk_rows += 1;
+                if chunk_rows == CHUNK_ROWS {
+                    row_groups.push(RowGroupMeta {
+                        num_rows: chunk_rows,
+                        min_key: chunk_min.take().unwrap(),
+                        max_key: chunk_max.take().unwrap(),
+                        min_ts: chunk_min_ts.take().unwrap(),
+                        max_ts: chunk_max_ts.take().unwrap(),
+                    });
+                    chunk_rows = 0;
+                }
             }
         }
 
@@ -451,25 +455,12 @@ impl SSTable {
         let mut writer = ArrowWriter::try_new(file, Arc::new(arrow_schema), Some(props))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        let mut current: Vec<(Key, u64, Option<Value>)> = Vec::with_capacity(CHUNK_ROWS);
-        for (key, seq, value) in skiplist.iter() {
-            if !include_tombstones && value.is_none() {
-                continue;
-            }
-            current.push((key.clone(), seq, value.clone()));
-            if current.len() == CHUNK_ROWS {
-                writer
-                    .write(&build_batch(&current, schema)?)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                current.clear();
-            }
-        }
-
-        if !current.is_empty() {
+        for batch in batches {
             writer
-                .write(&build_batch(&current, schema)?)
+                .write(batch)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         }
+
         writer
             .close()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -487,6 +478,20 @@ impl SSTable {
             index: Arc::new(index),
             row_cache: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    pub fn create_from_skiplist(
+        skiplist: &SkipList,
+        id: usize,
+        path: impl AsRef<Path>,
+        schema: &TableSchema,
+    ) -> io::Result<Self> {
+        let rows: Vec<(Key, u64, Option<Value>)> = skiplist.iter().collect();
+        let mut batches = Vec::new();
+        for chunk in rows.chunks(CHUNK_ROWS) {
+            batches.push(internal_batch_from_rows(chunk, schema)?);
+        }
+        Self::create_from_batches(&batches, id, path, schema)
     }
 
     pub fn open_from_path(path: impl AsRef<Path>, schema: &TableSchema) -> io::Result<Self> {
@@ -581,18 +586,6 @@ impl SSTable {
         Ok(None)
     }
 
-    fn overlapping_row_groups(&self, start: &Key, end: &Key) -> Option<(usize, usize)> {
-        let rgs = &self.index.row_groups;
-        if rgs.is_empty() {
-            return None;
-        }
-        let first = rgs.partition_point(|rg| rg.max_key < *start);
-        let last = rgs
-            .partition_point(|rg| rg.min_key <= *end)
-            .saturating_sub(1);
-        (first <= last).then_some((first, last))
-    }
-
     fn select_row_groups(
         rgs: &[RowGroupMeta],
         start: &Key,
@@ -627,119 +620,32 @@ impl SSTable {
         }
     }
 
-    pub fn scan(&self, start: &Key, end: &Key) -> io::Result<Vec<(Key, u64, Option<Value>)>> {
-        if self.entry_count == 0 || start > end || end < &self.min_key || start > &self.max_key {
-            return Ok(Vec::new());
-        }
-
-        let Some((first, last)) = self.overlapping_row_groups(start, end) else {
-            return Ok(Vec::new());
-        };
-
-        let file = File::open(&self.path)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let reader = builder.with_row_groups((first..=last).collect()).build()?;
-
-        let mut results = Vec::new();
-        for batch_result in reader {
-            let batch = batch_result.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let view = BatchView::new(&batch, &self.schema);
-            let field_cols: Vec<usize> = self
-                .schema
-                .columns
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| c.semantic == SemanticType::Field)
-                .map(|(c, _)| c)
-                .collect();
-
-            for i in 0..batch.num_rows() {
-                let k = key_at(&view, &self.schema, i);
-                if k > *end {
-                    return Ok(results);
-                }
-                if k >= *start {
-                    results.push((
-                        k,
-                        view.seq_value(i) as u64,
-                        value_at(&view, &self.schema, &field_cols, i),
-                    ));
-                }
-            }
-        }
-
-        Ok(results)
-    }
-
-    pub fn scan_iter(&self, start: &Key, end: &Key) -> io::Result<SSTableIter> {
-        if self.entry_count == 0 || start > end || end < &self.min_key || start > &self.max_key {
-            return Ok(SSTableIter::empty(
-                start.clone(),
-                end.clone(),
-                self.schema.clone(),
-            ));
-        }
-
-        let Some((first, last)) = self.overlapping_row_groups(start, end) else {
-            return Ok(SSTableIter::empty(
-                start.clone(),
-                end.clone(),
-                self.schema.clone(),
-            ));
-        };
-        let file = File::open(&self.path)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let reader = builder.with_row_groups((first..=last).collect()).build()?;
-        Ok(SSTableIter {
-            inner: Box::new(
-                reader.map(|r| r.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))),
-            ),
-            current: Vec::new(),
-            pos: 0,
-            start: start.clone(),
-            end: end.clone(),
-            ts_range: None,
-            schema: self.schema.clone(),
-        })
-    }
-
-    pub fn scan_iter_with_range(
+    pub fn scan_batches(
         &self,
         start: &Key,
         end: &Key,
-        ts: Option<(i64, i64)>,
-    ) -> io::Result<SSTableIter> {
+        ts_range: Option<(i64, i64)>,
+    ) -> io::Result<SSTableBatchIter> {
         if self.entry_count == 0 || start > end || end < &self.min_key || start > &self.max_key {
-            return Ok(SSTableIter::empty(
-                start.clone(),
-                end.clone(),
-                self.schema.clone(),
-            ));
+            return Ok(SSTableBatchIter::empty());
         }
-
-        let Some(rgs) = Self::select_row_groups(&self.index.row_groups, start, end, ts) else {
-            return Ok(SSTableIter::empty(
-                start.clone(),
-                end.clone(),
-                self.schema.clone(),
-            ));
+        let full = ts_range.is_none() && start <= &self.min_key && end >= &self.max_key;
+        let Some(rgs) = Self::select_row_groups(&self.index.row_groups, start, end, ts_range)
+        else {
+            return Ok(SSTableBatchIter::empty());
         };
-
         let file = File::open(&self.path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let reader = builder.with_row_groups(rgs).build()?;
-        Ok(SSTableIter {
+        Ok(SSTableBatchIter {
             inner: Box::new(
                 reader.map(|r| r.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))),
             ),
-            current: Vec::new(),
-            pos: 0,
             start: start.clone(),
             end: end.clone(),
-            ts_range: ts,
+            ts_range,
+            full,
             schema: self.schema.clone(),
         })
     }
@@ -773,81 +679,80 @@ impl SSTable {
     }
 }
 
-pub struct SSTableIter {
+pub struct SSTableBatchIter {
     inner: Box<dyn Iterator<Item = io::Result<RecordBatch>> + Send>,
-    current: Vec<(Key, u64, Option<Value>)>,
-    pos: usize,
     start: Key,
     end: Key,
     ts_range: Option<(i64, i64)>,
+    full: bool,
     schema: Arc<TableSchema>,
 }
 
-impl SSTableIter {
-    fn empty(start: Key, end: Key, schema: Arc<TableSchema>) -> Self {
+impl SSTableBatchIter {
+    fn empty() -> Self {
         Self {
             inner: Box::new(std::iter::empty()),
-            current: Vec::new(),
-            pos: 0,
-            start,
-            end,
+            start: (Vec::new(), i64::MIN),
+            end: (Vec::new(), i64::MIN),
             ts_range: None,
-            schema,
+            full: false,
+            schema: Arc::new(TableSchema::default_table()),
         }
     }
 
-    fn fill(&mut self) -> io::Result<bool> {
-        while self.pos >= self.current.len() {
-            match self.inner.next() {
-                None => return Ok(false),
-                Some(batch) => {
-                    let batch = batch?;
-                    let view = BatchView::new(&batch, &self.schema);
-                    let field_cols: Vec<usize> = self
-                        .schema
-                        .columns
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, c)| c.semantic == SemanticType::Field)
-                        .map(|(c, _)| c)
-                        .collect();
-                    self.current.clear();
-                    self.pos = 0;
-                    for i in 0..batch.num_rows() {
-                        let k = key_at(&view, &self.schema, i);
-                        if k > self.end {
-                            break;
-                        }
-                        if k >= self.start {
-                            if let Some((low, high)) = self.ts_range
-                                && (k.1 < low || k.1 > high)
-                            {
-                                continue;
-                            }
-                            self.current.push((
-                                k,
-                                view.seq_value(i) as u64,
-                                value_at(&view, &self.schema, &field_cols, i),
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-        Ok(true)
+    fn passes(&self, k: &Key) -> bool {
+        k >= &self.start
+            && k <= &self.end
+            && self
+                .ts_range
+                .map_or(true, |(low, high)| k.1 >= low && k.1 <= high)
     }
 }
 
-impl Iterator for SSTableIter {
-    type Item = (Key, u64, Option<Value>);
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.pos >= self.current.len() && !(self.fill().ok()?) {
-            return None;
-        }
+impl Iterator for SSTableBatchIter {
+    type Item = io::Result<RecordBatch>;
 
-        let item = self.current[self.pos].clone();
-        self.pos += 1;
-        Some(item)
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let batch = match self.inner.next() {
+                None => return None,
+                Some(Ok(b)) => b,
+                Some(Err(e)) => return Some(Err(e)),
+            };
+            if self.full {
+                return Some(Ok(batch));
+            }
+            if self.ts_range.is_none() && batch.num_rows() > 0 {
+                let view = BatchView::new(&batch, &self.schema);
+                let n = batch.num_rows();
+                let first = key_at(&view, &self.schema, 0);
+                let last = key_at(&view, &self.schema, n - 1);
+                if first >= self.start && last <= self.end {
+                    return Some(Ok(batch));
+                }
+                if last < self.start || first > self.end {
+                    continue;
+                }
+            }
+            let mask: Vec<bool> = {
+                let view = BatchView::new(&batch, &self.schema);
+                (0..batch.num_rows())
+                    .map(|i| self.passes(&key_at(&view, &self.schema, i)))
+                    .collect()
+            };
+            if mask.iter().all(|&m| m) {
+                return Some(Ok(batch));
+            }
+            if !mask.iter().any(|&m| m) {
+                continue;
+            }
+            let predicate = BooleanArray::from(mask);
+            match filter_record_batch(&batch, &predicate) {
+                Ok(filtered) if filtered.num_rows() > 0 => return Some(Ok(filtered)),
+                Ok(_) => continue,
+                Err(e) => return Some(Err(io::Error::new(io::ErrorKind::InvalidData, e))),
+            }
+        }
     }
 }
 
@@ -865,6 +770,39 @@ mod tests {
         s.as_bytes().to_vec()
     }
 
+    fn decode_batch(batch: &RecordBatch, schema: &TableSchema) -> Vec<(Key, u64, Option<Value>)> {
+        let view = BatchView::new(batch, schema);
+        let field_cols: Vec<usize> = schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.semantic == SemanticType::Field)
+            .map(|(c, _)| c)
+            .collect();
+        (0..batch.num_rows())
+            .map(|i| {
+                (
+                    key_at(&view, schema, i),
+                    view.seq_value(i) as u64,
+                    value_at(&view, schema, &field_cols, i),
+                )
+            })
+            .collect()
+    }
+
+    fn scan_rows(
+        sst: &SSTable,
+        start: &Key,
+        end: &Key,
+        ts: Option<(i64, i64)>,
+        schema: &TableSchema,
+    ) -> Vec<(Key, u64, Option<Value>)> {
+        sst.scan_batches(start, end, ts)
+            .unwrap()
+            .flat_map(|b| decode_batch(&b.unwrap(), schema))
+            .collect()
+    }
+
     #[test]
     fn test_sstable_create_and_get() -> io::Result<()> {
         let dir = tempdir().unwrap();
@@ -875,13 +813,8 @@ mod tests {
         skiplist.insert(k(20, 0), 2, Some(v("twenty")));
         skiplist.insert(k(30, 0), 3, Some(v("thirty")));
 
-        let sstable = SSTable::create_from_skiplist(
-            &skiplist,
-            1,
-            &path,
-            true,
-            &TableSchema::default_table(),
-        )?;
+        let sstable =
+            SSTable::create_from_skiplist(&skiplist, 1, &path, &TableSchema::default_table())?;
 
         assert_eq!(sstable.entry_count(), 3);
         assert_eq!(sstable.min_key(), &k(10, 0));
@@ -913,31 +846,56 @@ mod tests {
         skiplist.insert(k(40, 0), 4, Some(v("forty")));
         skiplist.insert(k(50, 0), 5, Some(v("fifty")));
 
-        let sstable = SSTable::create_from_skiplist(
-            &skiplist,
-            1,
-            &path,
-            true,
-            &TableSchema::default_table(),
-        )?;
+        let sstable =
+            SSTable::create_from_skiplist(&skiplist, 1, &path, &TableSchema::default_table())?;
 
-        let result = sstable.scan(&k(20, 0), &k(40, 0))?;
+        let result = scan_rows(
+            &sstable,
+            &k(20, 0),
+            &k(40, 0),
+            None,
+            &TableSchema::default_table(),
+        );
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].0, k(20, 0));
         assert_eq!(result[1].0, k(30, 0));
         assert_eq!(result[2].0, k(40, 0));
 
-        let result = sstable.scan(&k(10, 0), &k(10, 0))?;
+        let result = scan_rows(
+            &sstable,
+            &k(10, 0),
+            &k(10, 0),
+            None,
+            &TableSchema::default_table(),
+        );
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, k(10, 0));
 
-        let result = sstable.scan(&k(1, 0), &k(5, 0))?;
+        let result = scan_rows(
+            &sstable,
+            &k(1, 0),
+            &k(5, 0),
+            None,
+            &TableSchema::default_table(),
+        );
         assert!(result.is_empty());
 
-        let result = sstable.scan(&k(60, 0), &k(70, 0))?;
+        let result = scan_rows(
+            &sstable,
+            &k(60, 0),
+            &k(70, 0),
+            None,
+            &TableSchema::default_table(),
+        );
         assert!(result.is_empty());
 
-        let result = sstable.scan(&k(30, 0), &k(20, 0))?;
+        let result = scan_rows(
+            &sstable,
+            &k(30, 0),
+            &k(20, 0),
+            None,
+            &TableSchema::default_table(),
+        );
         assert!(result.is_empty());
 
         Ok(())
@@ -952,7 +910,7 @@ mod tests {
         list.insert((vec![1], 200), 2, None);
         list.insert((vec![2], 100), 3, Some(v("b")));
 
-        SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())?;
+        SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table())?;
 
         let file = File::open(&path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
@@ -991,8 +949,7 @@ mod tests {
         let list = SkipList::new();
         list.insert((vec![1], 10), 1, Some(v("a")));
         list.insert((vec![1], 20), 2, None);
-        let sst =
-            SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())?;
+        let sst = SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table())?;
 
         assert_eq!(sst.get(&(vec![1], 20))?.unwrap().0, 2);
         assert_eq!(sst.get(&(vec![1], 20))?.unwrap().1, None);
@@ -1023,9 +980,14 @@ mod tests {
                 Some(v(&format!("v{}", i))),
             );
         }
-        let sst =
-            SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())?;
-        let got: Vec<_> = sst.scan_iter(&(vec![3], 3), &(vec![6], 6))?.collect();
+        let sst = SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table())?;
+        let got: Vec<_> = scan_rows(
+            &sst,
+            &(vec![3], 3),
+            &(vec![6], 6),
+            None,
+            &TableSchema::default_table(),
+        );
         assert_eq!(got.len(), 4);
         assert_eq!(got[0].0, (vec![3], 3));
         assert_eq!(got[0].1, 4);
@@ -1096,7 +1058,7 @@ mod tests {
                 Some(schema.encode_fields(c)),
             );
         }
-        let sst = SSTable::create_from_skiplist(&list, 1, &path, true, &schema)?;
+        let sst = SSTable::create_from_skiplist(&list, 1, &path, &schema)?;
         let k = schema.cells_to_key(&rows[1]);
         assert_eq!(
             sst.get(&k)?.unwrap().1,
@@ -1107,7 +1069,7 @@ mod tests {
         let reopened = SSTable::open_from_path(&path, &schema)?;
         assert_eq!(reopened.entry_count(), 3);
         assert_eq!(reopened.min_key(), sst.min_key());
-        let got = sst.scan(sst.min_key(), sst.max_key())?;
+        let got = scan_rows(&reopened, sst.min_key(), sst.max_key(), None, &schema);
         assert_eq!(got.len(), 3);
         Ok(())
     }
@@ -1186,8 +1148,7 @@ mod tests {
         for i in 0..20_000i64 {
             list.insert((vec![0], i), i as u64 + 1, Some(v(&format!("v{}", i))));
         }
-        let sst =
-            SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())?;
+        let sst = SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table())?;
         assert_eq!(sst.entry_count(), 20_000);
         assert_eq!(sst.min_key(), &k(0, 0));
         assert_eq!(sst.max_key(), &k(0, 19_999));
@@ -1208,16 +1169,33 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("2.sst");
         let list = SkipList::new();
-        let sst =
-            SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())?;
+        let sst = SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table())?;
         assert_eq!(sst.entry_count(), 0);
         assert_eq!(sst.max_seq(), 0);
 
         let reopened = SSTable::open_from_path(&path, &TableSchema::default_table())?;
         assert_eq!(reopened.entry_count(), 0);
         assert_eq!(reopened.get(&k(5, 0))?, None);
-        assert!(reopened.scan(&k(0, 0), &k(9, 9))?.is_empty());
-        assert!(reopened.scan_iter(&k(0, 0), &k(9, 9))?.next().is_none());
+        assert!(
+            scan_rows(
+                &reopened,
+                &k(0, 0),
+                &k(9, 9),
+                None,
+                &TableSchema::default_table()
+            )
+            .is_empty()
+        );
+        assert!(
+            scan_rows(
+                &reopened,
+                &k(0, 0),
+                &k(9, 9),
+                None,
+                &TableSchema::default_table()
+            )
+            .is_empty()
+        );
         Ok(())
     }
 
@@ -1227,7 +1205,7 @@ mod tests {
         let path = dir.path().join("3.sst");
         let list = SkipList::new();
         list.insert(k(1, 0), 1, Some(v("a")));
-        SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())?;
+        SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table())?;
         assert!(path.exists());
         assert!(!dir.path().join("3.sst.tmp").exists());
         Ok(())
@@ -1241,20 +1219,37 @@ mod tests {
         for i in 0..20_000i64 {
             list.insert((vec![0], i), i as u64 + 1, Some(v(&format!("v{}", i))));
         }
-        let sst =
-            SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())?;
+        let sst = SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table())?;
 
-        let single = sst.scan(&k(0, 100), &k(0, 200))?;
+        let single = scan_rows(
+            &sst,
+            &k(0, 100),
+            &k(0, 200),
+            None,
+            &TableSchema::default_table(),
+        );
         assert_eq!(single.len(), 101);
         assert_eq!(single[0].0, k(0, 100));
         assert_eq!(single[100].0, k(0, 200));
 
-        let cross = sst.scan(&k(0, 8190), &k(0, 8193))?;
+        let cross = scan_rows(
+            &sst,
+            &k(0, 8190),
+            &k(0, 8193),
+            None,
+            &TableSchema::default_table(),
+        );
         assert_eq!(cross.len(), 4);
         assert_eq!(cross[0].0, k(0, 8190));
         assert_eq!(cross[3].0, k(0, 8193));
 
-        let full = sst.scan(&k(0, 0), &k(0, 19_999))?;
+        let full = scan_rows(
+            &sst,
+            &k(0, 0),
+            &k(0, 19_999),
+            None,
+            &TableSchema::default_table(),
+        );
         assert_eq!(full.len(), 20_000);
         let sub: Vec<Key> = full
             .iter()
@@ -1324,13 +1319,16 @@ mod tests {
         list.insert(k(10, 100), 1, Some(v("a")));
         list.insert(k(20, 50), 2, Some(v("b")));
         list.insert(k(20, 90), 3, Some(v("c")));
-        let sst =
-            SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())?;
+        let sst = SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table())?;
         assert_eq!(sst.ts_extent(), Some((50, 100)));
 
-        let got: Vec<_> = sst
-            .scan_iter_with_range(sst.min_key(), sst.max_key(), Some((i64::MIN, 59)))?
-            .collect();
+        let got: Vec<_> = scan_rows(
+            &sst,
+            sst.min_key(),
+            sst.max_key(),
+            Some((i64::MIN, 59)),
+            &TableSchema::default_table(),
+        );
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].0, k(20, 50));
         Ok(())
@@ -1344,20 +1342,27 @@ mod tests {
         for i in 0..24_576i64 {
             list.insert((vec![1], i), i as u64 + 1, Some(v(&format!("v{}", i))));
         }
-        let sst =
-            SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())?;
+        let sst = SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table())?;
         assert_eq!(sst.ts_extent(), Some((0, 24_575)));
 
-        let got: Vec<_> = sst
-            .scan_iter_with_range(sst.min_key(), sst.max_key(), Some((9000, 9200)))?
-            .collect();
+        let got: Vec<_> = scan_rows(
+            &sst,
+            sst.min_key(),
+            sst.max_key(),
+            Some((9000, 9200)),
+            &TableSchema::default_table(),
+        );
         assert_eq!(got.len(), 201);
         assert_eq!(got[0].0, k(1, 9000));
         assert_eq!(got[200].0, k(1, 9200));
 
-        let got: Vec<_> = sst
-            .scan_iter_with_range(sst.min_key(), sst.max_key(), Some((30_000, 40_000)))?
-            .collect();
+        let got: Vec<_> = scan_rows(
+            &sst,
+            sst.min_key(),
+            sst.max_key(),
+            Some((30_000, 40_000)),
+            &TableSchema::default_table(),
+        );
         assert!(got.is_empty());
         Ok(())
     }

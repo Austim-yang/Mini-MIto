@@ -30,7 +30,6 @@ fn bench_sstable_create(c: &mut Criterion) {
                         &list,
                         1,
                         &path,
-                        true,
                         &TableSchema::default_table(),
                     )
                     .unwrap();
@@ -50,8 +49,8 @@ fn bench_sstable_get(c: &mut Criterion) {
     }
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.sst");
-    let sst = SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())
-        .unwrap();
+    let sst =
+        SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table()).unwrap();
     let mut rng = rng();
 
     c.bench_function("sstable_get_hit", |b| {
@@ -76,12 +75,17 @@ fn bench_sstable_scan(c: &mut Criterion) {
     }
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.sst");
-    let sst = SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())
-        .unwrap();
+    let sst =
+        SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table()).unwrap();
 
     c.bench_function("sstable_scan_all", |b| {
         b.iter(|| {
-            let _ = sst.scan(&key(0), &key(size - 1)).unwrap();
+            let n: usize = sst
+                .scan_batches(&key(0), &key(size - 1), None)
+                .unwrap()
+                .map(|b| b.unwrap().num_rows())
+                .sum();
+            black_box(n);
         });
     });
 
@@ -89,7 +93,12 @@ fn bench_sstable_scan(c: &mut Criterion) {
         b.iter(|| {
             let start = black_box(size / 10);
             let end = black_box(size / 10 * 2);
-            let _ = sst.scan(&key(start as u64), &key(end as u64)).unwrap();
+            let n: usize = sst
+                .scan_batches(&key(start as u64), &key(end as u64), None)
+                .unwrap()
+                .map(|b| b.unwrap().num_rows())
+                .sum();
+            black_box(n);
         });
     });
 }
@@ -102,24 +111,29 @@ fn bench_sstable_scan_time_range(c: &mut Criterion) {
     }
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.sst");
-    let sst = SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())
-        .unwrap();
+    let sst =
+        SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table()).unwrap();
     let min = sst.min_key().clone();
     let max = sst.max_key().clone();
 
     c.bench_function("sstable_scan_iter_all_100k", |b| {
         b.iter(|| {
-            let rows: Vec<_> = sst.scan_iter(&min, &max).unwrap().collect();
-            black_box(rows);
+            let n: usize = sst
+                .scan_batches(&min, &max, None)
+                .unwrap()
+                .map(|b| b.unwrap().num_rows())
+                .sum();
+            black_box(n);
         });
     });
     c.bench_function("sstable_scan_iter_time_range_100k", |b| {
         b.iter(|| {
-            let rows: Vec<_> = sst
-                .scan_iter_with_range(&min, &max, Some((20_000, 40_000)))
+            let n: usize = sst
+                .scan_batches(&min, &max, Some((20_000, 40_000)))
                 .unwrap()
-                .collect();
-            black_box(rows);
+                .map(|b| b.unwrap().num_rows())
+                .sum();
+            black_box(n);
         });
     });
 }
@@ -132,8 +146,8 @@ fn bench_sstable_get_100k(c: &mut Criterion) {
     }
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.sst");
-    let sst = SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())
-        .unwrap();
+    let sst =
+        SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table()).unwrap();
     let mut rng = rng();
 
     c.bench_function("sstable_get_hit_100k", |b| {
@@ -158,19 +172,29 @@ fn bench_sstable_scan_100k(c: &mut Criterion) {
     }
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.sst");
-    let sst = SSTable::create_from_skiplist(&list, 1, &path, true, &TableSchema::default_table())
-        .unwrap();
+    let sst =
+        SSTable::create_from_skiplist(&list, 1, &path, &TableSchema::default_table()).unwrap();
 
     c.bench_function("sstable_scan_all_100k", |b| {
         b.iter(|| {
-            let _ = sst.scan(&key(0), &key(size - 1)).unwrap();
+            let n: usize = sst
+                .scan_batches(&key(0), &key(size - 1), None)
+                .unwrap()
+                .map(|b| b.unwrap().num_rows())
+                .sum();
+            black_box(n);
         });
     });
     c.bench_function("sstable_scan_range_10pct_100k", |b| {
         b.iter(|| {
             let start = black_box(size / 10);
             let end = black_box(size / 10 * 2);
-            let _ = sst.scan(&key(start), &key(end)).unwrap();
+            let n: usize = sst
+                .scan_batches(&key(start), &key(end), None)
+                .unwrap()
+                .map(|b| b.unwrap().num_rows())
+                .sum();
+            black_box(n);
         });
     });
 }

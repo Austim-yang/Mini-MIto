@@ -1,9 +1,10 @@
-use std::hint::black_box;
+use std::{hint::black_box, sync::Arc};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use mini_mito::{
     Key, Region, Value,
-    memtable::{SkipList, Wal, wal::Operation},
+    memtable::{SkipList, Wal, version::Source, wal::Operation},
+    query::merge::MergeBatchIter,
     schema::TableSchema,
     sstable::sstable::SSTable,
 };
@@ -71,14 +72,9 @@ fn bench_create_sstable(c: &mut Criterion) {
                 let list = build_skiplist(size);
                 let dir = tempdir().unwrap();
                 let path = dir.path().join("temp.sst");
-                let sst = SSTable::create_from_skiplist(
-                    &list,
-                    0,
-                    &path,
-                    true,
-                    &TableSchema::default_table(),
-                )
-                .unwrap();
+                let sst =
+                    SSTable::create_from_skiplist(&list, 0, &path, &TableSchema::default_table())
+                        .unwrap();
                 black_box(sst);
             });
         });
@@ -93,16 +89,19 @@ fn bench_sstable_scan(c: &mut Criterion) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("scan.sst");
         let sstable =
-            SSTable::create_from_skiplist(&list, 0, &path, true, &TableSchema::default_table())
-                .unwrap();
+            SSTable::create_from_skiplist(&list, 0, &path, &TableSchema::default_table()).unwrap();
         let min = sstable.min_key().clone();
         let max = sstable.max_key().clone();
 
         group.throughput(Throughput::Elements(*size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &sstable, |b, sst| {
             b.iter(|| {
-                let results = sst.scan(&min, &max).unwrap();
-                black_box(results);
+                let n: usize = sst
+                    .scan_batches(&min, &max, None)
+                    .unwrap()
+                    .map(|b| b.unwrap().num_rows())
+                    .sum();
+                black_box(n);
             });
         });
     }
@@ -131,7 +130,6 @@ fn bench_compaction(c: &mut Criterion) {
                 &list,
                 id as usize,
                 &path,
-                true,
                 &TableSchema::default_table(),
             )
             .unwrap();
@@ -143,23 +141,25 @@ fn bench_compaction(c: &mut Criterion) {
             &(dir.path().to_path_buf(), sstables),
             |b, (dir, ssts)| {
                 b.iter(|| {
-                    let merged = SkipList::new();
-                    for sst in ssts {
-                        let pairs = sst.scan(sst.min_key(), sst.max_key()).unwrap();
-                        for (k, seq, v) in pairs {
-                            merged.insert(k, seq, v);
-                        }
-                    }
-                    let new_path = dir.join("merged.sst");
-                    let _new_sst = SSTable::create_from_skiplist(
+                    let sources = ssts
+                        .iter()
+                        .map(|sst| {
+                            Source::Sst(
+                                sst.scan_batches(sst.min_key(), sst.max_key(), None)
+                                    .unwrap(),
+                            )
+                        })
+                        .collect();
+                    let merge =
+                        MergeBatchIter::new(sources, Arc::new(TableSchema::default_table()));
+                    let merged: Vec<_> = merge.map(|b| b.unwrap()).collect();
+                    let _new_sst = SSTable::create_from_batches(
                         &merged,
-                        999,
-                        &new_path,
-                        true,
+                        99,
+                        dir.join("merged.sst"),
                         &TableSchema::default_table(),
                     )
                     .unwrap();
-                    black_box(merged);
                 });
             },
         );

@@ -1,9 +1,10 @@
 use std::{io, sync::Arc};
 
+use arrow::array::RecordBatch;
+
 use crate::{
-    Key, Value,
     memtable::{ImmutableMemtable, Memtable},
-    sstable::sstable::SSTable,
+    sstable::sstable::{SSTable, SSTableBatchIter},
 };
 
 pub struct Version {
@@ -37,49 +38,22 @@ impl Version {
             seq: self.seq,
         }
     }
+}
 
-    pub fn sources(&self) -> io::Result<Vec<Box<dyn Iterator<Item = (Key, u64, Option<Value>)>>>> {
-        let mut out: Vec<Box<dyn Iterator<Item = (Key, u64, Option<Value>)>>> = Vec::new();
-        if self.active.len() > 0 {
-            out.push(Box::new(self.active.iter().collect::<Vec<_>>().into_iter()));
-        }
-        for imm in self.immutables.iter().rev() {
-            if imm.len() > 0 {
-                out.push(Box::new(imm.iter().collect::<Vec<_>>().into_iter()));
-            }
-        }
-        for sst in self.ssts.iter().rev() {
-            out.push(Box::new(sst.scan_iter(sst.min_key(), sst.max_key())?));
-        }
-        Ok(out)
+pub enum Source {
+    Sst(SSTableBatchIter),
+    Memtable(Option<Arc<RecordBatch>>),
+}
+
+impl Source {
+    pub fn memtable(batch: RecordBatch) -> Self {
+        Source::Memtable(Some(Arc::new(batch)))
     }
 
-    pub fn sources_with_range(
-        &self,
-        (lo, hi): (i64, i64),
-    ) -> io::Result<Vec<Box<dyn Iterator<Item = (Key, u64, Option<Value>)>>>> {
-        let mut out: Vec<Box<dyn Iterator<Item = (Key, u64, Option<Value>)>>> = Vec::new();
-        if self.active.len() > 0 {
-            out.push(Box::new(self.active.iter().collect::<Vec<_>>().into_iter()));
+    pub fn next_batch(&mut self) -> io::Result<Option<Arc<RecordBatch>>> {
+        match self {
+            Source::Sst(iter) => iter.next().transpose().map(|o| o.map(Arc::new)),
+            Source::Memtable(slot) => Ok(slot.take()),
         }
-        for imm in self.immutables.iter().rev() {
-            if imm.len() > 0 {
-                out.push(Box::new(imm.iter().collect::<Vec<_>>().into_iter()));
-            }
-        }
-        for sst in self.ssts.iter().rev() {
-            let overlaps = match sst.ts_extent() {
-                None => true,
-                Some((slo, shi)) => shi >= lo && slo <= hi,
-            };
-            if overlaps {
-                out.push(Box::new(sst.scan_iter_with_range(
-                    sst.min_key(),
-                    sst.max_key(),
-                    Some((lo, hi)),
-                )?));
-            }
-        }
-        Ok(out)
     }
 }

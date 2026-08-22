@@ -28,14 +28,18 @@ fn bench_datafusion_full_scan(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("datafusion_full_scan");
     for size in [1_000, 10_000, 50_000].iter() {
-        group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
-            b.to_async(&rt).iter(|| async {
-                let (provider, _dir) = setup_data(size);
-                let ctx = SessionContext::new();
-                ctx.register_table("t", provider).unwrap();
-                let df = ctx.sql("SELECT * FROM t").await.unwrap();
-                let batches = df.collect().await.unwrap();
-                black_box(batches);
+        // setup 移出计时：只测查询成本
+        let (provider, _dir) = setup_data(*size);
+        group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, _| {
+            b.to_async(&rt).iter(|| {
+                let provider = provider.clone();
+                async move {
+                    let ctx = SessionContext::new();
+                    ctx.register_table("t", provider).unwrap();
+                    let df = ctx.sql("SELECT * FROM t").await.unwrap();
+                    let batches = df.collect().await.unwrap();
+                    black_box(batches);
+                }
             });
         });
     }
@@ -45,14 +49,17 @@ fn bench_datafusion_full_scan(c: &mut Criterion) {
 fn bench_datafusion_projection(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let size = 10_000;
+    let (provider, _dir) = setup_data(size);
     c.bench_function("datafusion_projection_tags_timestamp", |b| {
-        b.to_async(&rt).iter(|| async {
-            let (provider, _dir) = setup_data(size);
-            let ctx = SessionContext::new();
-            ctx.register_table("t", provider).unwrap();
-            let df = ctx.sql("SELECT tags, timestamp FROM t").await.unwrap();
-            let batches = df.collect().await.unwrap();
-            black_box(batches);
+        b.to_async(&rt).iter(|| {
+            let provider = provider.clone();
+            async move {
+                let ctx = SessionContext::new();
+                ctx.register_table("t", provider).unwrap();
+                let df = ctx.sql("SELECT tags, timestamp FROM t").await.unwrap();
+                let batches = df.collect().await.unwrap();
+                black_box(batches);
+            }
         });
     });
 }
@@ -60,17 +67,20 @@ fn bench_datafusion_projection(c: &mut Criterion) {
 fn bench_datafusion_filter(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let size = 10_000;
+    let (provider, _dir) = setup_data(size);
     c.bench_function("datafusion_filter_timestamp_gt_half", |b| {
-        b.to_async(&rt).iter(|| async {
-            let (provider, _dir) = setup_data(size);
-            let ctx = SessionContext::new();
-            ctx.register_table("t", provider).unwrap();
-            let df = ctx
-                .sql(&format!("SELECT * FROM t WHERE timestamp > {}", size / 2))
-                .await
-                .unwrap();
-            let batches = df.collect().await.unwrap();
-            black_box(batches);
+        b.to_async(&rt).iter(|| {
+            let provider = provider.clone();
+            async move {
+                let ctx = SessionContext::new();
+                ctx.register_table("t", provider).unwrap();
+                let df = ctx
+                    .sql(&format!("SELECT * FROM t WHERE timestamp > {}", size / 2))
+                    .await
+                    .unwrap();
+                let batches = df.collect().await.unwrap();
+                black_box(batches);
+            }
         });
     });
 }

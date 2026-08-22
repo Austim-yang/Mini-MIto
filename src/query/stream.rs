@@ -3,9 +3,12 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    vec,
 };
 
+use arrow::{
+    array::{BooleanArray, Int8Array},
+    compute::filter_record_batch,
+};
 use datafusion::{
     arrow::{
         array::{ArrayRef, RecordBatch},
@@ -20,26 +23,23 @@ use futures::Stream;
 
 use crate::{
     memtable::memtable::Region,
-    query::{merge::MergeIter, predicate::TimeRange},
-    schema::{SemanticType, TableSchema, cells_to_array},
-    types::{Key, Value},
+    query::{merge::MergeBatchIter, predicate::TimeRange},
+    schema::TableSchema,
+    sstable::sstable::OP_DELETE,
 };
-
-const BATCH_SIZE: usize = 10_000;
 
 pub struct LSMStream {
     schema: SchemaRef,
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
     table_schema: Arc<TableSchema>,
-    merge: MergeIter,
+    user_schema: SchemaRef,
+    merge: MergeBatchIter,
     batches: Vec<RecordBatch>,
     index: usize,
     emitted: usize,
+    finished: bool,
 }
-
-impl Unpin for LSMStream {}
-unsafe impl Send for LSMStream {}
 
 impl RecordBatchStream for LSMStream {
     fn schema(&self) -> SchemaRef {
@@ -80,89 +80,79 @@ impl LSMStream {
         let table_schema = region.schema();
         let sources = match time_range.to_inclusive_bounds() {
             None => Vec::new(),
-            Some(b) => region.snapshot_sources_with_range(b)?,
+            Some(b) => region.snapshot_columnar_sources(Some(b))?,
         };
+        let user_schema = Arc::new(table_schema.arrow_schema());
+        let merge = MergeBatchIter::new(sources, table_schema.clone());
         Ok(Self {
             schema,
             projection,
             limit,
             table_schema,
-            merge: MergeIter::new(sources),
+            user_schema,
+            merge,
             batches: Vec::new(),
             index: 0,
             emitted: 0,
+            finished: false,
         })
     }
 
-    fn build_record_batch(
-        chunk: &[(Key, Value)],
-        table_schema: &TableSchema,
-        projection: Option<&[usize]>,
-    ) -> DataFusionResult<RecordBatch> {
-        let ncols = table_schema.columns.len();
-        let mut cols: Vec<Vec<Option<Vec<u8>>>> = vec![Vec::with_capacity(chunk.len()); ncols];
-
-        for (key, value) in chunk {
-            let tags = table_schema.decode_tags(&key.0);
-            let ts = key.1.to_le_bytes().to_vec();
-            let fields = table_schema.decode_fields(value);
-            let mut tag_i = 0;
-            let mut field_i = 0;
-            for (c, col) in table_schema.columns.iter().enumerate() {
-                let cell = match col.semantic {
-                    SemanticType::Tag => Some(tags[tag_i].clone()),
-                    SemanticType::Timestamp => Some(ts.clone()),
-                    SemanticType::Field => Some(fields[field_i].clone()),
-                };
-                cols[c].push(cell);
-                match col.semantic {
-                    SemanticType::Tag => tag_i += 1,
-                    SemanticType::Field => field_i += 1,
-                    SemanticType::Timestamp => {}
-                }
-            }
-        }
-
-        let arrays: Vec<ArrayRef> = (0..ncols)
-            .map(|c| cells_to_array(&table_schema.columns[c].data_type, &cols[c]))
-            .collect();
-        let full = RecordBatch::try_new(Arc::new(table_schema.arrow_schema()), arrays)
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-        match projection {
-            Some(indices) => full
-                .project(indices)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None)),
-            None => Ok(full),
-        }
+    fn strip_internal(&self, batch: &RecordBatch) -> DataFusionResult<RecordBatch> {
+        let ncols = self.table_schema.columns.len();
+        let op = batch
+            .column(ncols + 1)
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .expect("__op_type must be Int8");
+        let has_delete = op.iter().flatten().any(|v| v == OP_DELETE);
+        let filtered = if has_delete {
+            let mask: BooleanArray =
+                BooleanArray::from_iter(op.iter().map(|v| v != Some(OP_DELETE)));
+            filter_record_batch(batch, &mask)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
+        } else {
+            batch.clone()
+        };
+        let arrays: Vec<ArrayRef> = (0..ncols).map(|c| filtered.column(c).clone()).collect();
+        RecordBatch::try_new(self.user_schema.clone(), arrays)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
 
     fn refill(&mut self) -> DataFusionResult<bool> {
-        if self.batches.len() > self.index {
+        if self.finished || self.batches.len() > self.index {
+            return Ok(!self.finished && !self.batches.is_empty());
+        }
+        loop {
+            let Some(result) = self.merge.next() else {
+                return Ok(false);
+            };
+            let internal =
+                result.map_err(|e| DataFusionError::Internal(format!("lsm merge failed: {e}")))?;
+            let user = self.strip_internal(&internal)?;
+            let projected = match &self.projection {
+                Some(indices) => user
+                    .project(indices)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
+                None => user,
+            };
+            if projected.num_rows() == 0 {
+                continue;
+            }
+            if let Some(lim) = self.limit {
+                let remaining = lim - self.emitted;
+                if projected.num_rows() >= remaining {
+                    let sliced = projected.slice(0, remaining);
+                    self.emitted += remaining;
+                    self.batches.push(sliced);
+                    self.finished = true;
+                    return Ok(true);
+                }
+                self.emitted += projected.num_rows();
+            }
+            self.batches.push(projected);
             return Ok(true);
         }
-        let mut rows: Vec<(Key, Value)> = Vec::new();
-        while rows.len() < BATCH_SIZE {
-            match self.merge.next() {
-                Some((k, Some(v))) => {
-                    rows.push((k, v));
-                    self.emitted += 1;
-                    if let Some(lim) = self.limit
-                        && self.emitted >= lim
-                    {
-                        break;
-                    }
-                }
-                Some((_, None)) => {}
-                None => break,
-            }
-        }
-        if rows.is_empty() {
-            return Ok(false);
-        }
-        let batch =
-            Self::build_record_batch(&rows, &self.table_schema, self.projection.as_deref())?;
-        self.batches.push(batch);
-        Ok(true)
     }
 }
 

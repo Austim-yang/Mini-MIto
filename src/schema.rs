@@ -1,8 +1,9 @@
-use std::{sync::Arc, unreachable, vec};
+use std::{sync::Arc, vec};
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int8Array, Int64Array, RecordBatch,
-    StringArray, TimestampNanosecondArray,
+    Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder, Float64Array,
+    Float64Builder, Int8Array, Int8Builder, Int64Array, Int64Builder, RecordBatch, StringArray,
+    StringBuilder, TimestampNanosecondArray, TimestampNanosecondBuilder,
 };
 use arrow_schema::{DataType, Field, Schema};
 
@@ -319,6 +320,109 @@ pub(crate) fn cells_to_array(dt: &DataType, rows: &[Option<Vec<u8>>]) -> ArrayRe
             })))
         }
         other => unimplemented!("array build for {other:?}"),
+    }
+}
+
+pub(crate) enum TypedBuilder {
+    Binary(BinaryBuilder),
+    Utf8(StringBuilder),
+    Int8(Int8Builder),
+    Int64(Int64Builder),
+    Float64(Float64Builder),
+    Boolean(BooleanBuilder),
+    Timestamp(TimestampNanosecondBuilder),
+}
+
+impl TypedBuilder {
+    pub fn with_capacity(dt: &DataType, n: usize) -> Self {
+        match dt {
+            DataType::Binary => Self::Binary(BinaryBuilder::with_capacity(n, n * 8)),
+            DataType::Utf8 => Self::Utf8(StringBuilder::with_capacity(n, n * 8)),
+            DataType::Int8 => Self::Int8(Int8Builder::with_capacity(n)),
+            DataType::Int64 => Self::Int64(Int64Builder::with_capacity(n)),
+            DataType::Float64 => Self::Float64(Float64Builder::with_capacity(n)),
+            DataType::Boolean => Self::Boolean(BooleanBuilder::with_capacity(n)),
+            DataType::Timestamp(..) => {
+                Self::Timestamp(TimestampNanosecondBuilder::with_capacity(n))
+            }
+            other => unimplemented!("type builder for {other:?}"),
+        }
+    }
+
+    pub fn append_from(&mut self, src: &dyn Array, row: usize) {
+        match self {
+            Self::Binary(b) => {
+                let a = src.as_any().downcast_ref::<BinaryArray>().unwrap();
+                if a.is_null(row) {
+                    b.append_null();
+                } else {
+                    b.append_value(a.value(row));
+                }
+            }
+            Self::Utf8(b) => {
+                let a = src.as_any().downcast_ref::<StringArray>().unwrap();
+                if a.is_null(row) {
+                    b.append_null();
+                } else {
+                    b.append_value(a.value(row));
+                }
+            }
+            Self::Int8(b) => {
+                let a = src.as_any().downcast_ref::<Int8Array>().unwrap();
+                if a.is_null(row) {
+                    b.append_null();
+                } else {
+                    b.append_value(a.value(row));
+                }
+            }
+            Self::Int64(b) => {
+                let a = src.as_any().downcast_ref::<Int64Array>().unwrap();
+                if a.is_null(row) {
+                    b.append_null();
+                } else {
+                    b.append_value(a.value(row));
+                }
+            }
+            Self::Float64(b) => {
+                let a = src.as_any().downcast_ref::<Float64Array>().unwrap();
+                if a.is_null(row) {
+                    b.append_null();
+                } else {
+                    b.append_value(a.value(row));
+                }
+            }
+            Self::Boolean(b) => {
+                let a = src.as_any().downcast_ref::<BooleanArray>().unwrap();
+                if a.is_null(row) {
+                    b.append_null();
+                } else {
+                    b.append_value(a.value(row));
+                }
+            }
+            Self::Timestamp(b) => {
+                let a = src
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .unwrap();
+                if a.is_null(row) {
+                    b.append_null();
+                } else {
+                    b.append_value(a.value(row));
+                }
+            }
+        }
+    }
+
+    pub fn finish(self) -> ArrayRef {
+        match self {
+            Self::Binary(mut b) => Arc::new(b.finish()),
+            Self::Utf8(mut b) => Arc::new(b.finish()),
+            Self::Int8(mut b) => Arc::new(b.finish()),
+            Self::Int64(mut b) => Arc::new(b.finish()),
+            Self::Float64(mut b) => Arc::new(b.finish()),
+            Self::Boolean(mut b) => Arc::new(b.finish()),
+            Self::Timestamp(mut b) => Arc::new(b.finish()),
+        }
     }
 }
 
